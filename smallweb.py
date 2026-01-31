@@ -91,9 +91,17 @@ class WebGraph:
         # Reconstruct without fragment
         return f"{parsed.scheme}://{parsed.netloc}{path}"
 
-    def pagerank(self, damping: float = 0.95, iterations: int = 50) -> Dict[str, float]:
+    def pagerank(self, damping: float = 0.95, iterations: int = 50,
+                 personalized: bool = True) -> Dict[str, float]:
         """
         Compute PageRank over the local graph.
+
+        When personalized=True (default), uses Personalized PageRank:
+        the random walker teleports back to SEED nodes instead of
+        uniformly to all nodes. This biases rankings toward your
+        seeds' neighborhood — sites that your community links to
+        rank higher than generically popular sites.
+
         Returns {url: score} sorted by score descending.
         """
         all_urls = set(self.nodes.keys())
@@ -104,11 +112,26 @@ class WebGraph:
         urls = list(all_urls)
         url_to_idx = {url: i for i, url in enumerate(urls)}
 
+        # Build teleportation vector
+        # Personalized: teleport to seeds. Standard: teleport uniformly.
+        teleport = [0.0] * n
+        if personalized and self.seeds:
+            seed_indices = [url_to_idx[s] for s in self.seeds if s in url_to_idx]
+            if seed_indices:
+                seed_weight = 1.0 / len(seed_indices)
+                for idx in seed_indices:
+                    teleport[idx] = seed_weight
+            else:
+                # Fallback to uniform if no seeds in graph
+                teleport = [1.0 / n] * n
+        else:
+            teleport = [1.0 / n] * n
+
         # Initialize uniform
         scores = [1.0 / n] * n
 
         for _ in range(iterations):
-            new_scores = [(1 - damping) / n] * n
+            new_scores = [(1 - damping) * teleport[j] for j in range(n)]
 
             for from_url, to_urls in self.edges.items():
                 if from_url not in url_to_idx:
@@ -117,9 +140,9 @@ class WebGraph:
                 # Only count edges to nodes we know about
                 valid_targets = [u for u in to_urls if u in url_to_idx]
                 if not valid_targets:
-                    # Dangling node: distribute evenly
+                    # Dangling node: distribute to teleport targets
                     for j in range(n):
-                        new_scores[j] += damping * scores[from_idx] / n
+                        new_scores[j] += damping * scores[from_idx] * teleport[j]
                 else:
                     share = damping * scores[from_idx] / len(valid_targets)
                     for to_url in valid_targets:
@@ -131,23 +154,110 @@ class WebGraph:
         return dict(sorted(result.items(), key=lambda x: x[1], reverse=True))
 
     def discoveries(self, top_n: int = 20, damping: float = 0.95,
-                     iterations: int = 50) -> List[Tuple[str, float, dict]]:
+                     iterations: int = 50, use_quality: bool = True) -> List[Tuple[str, float, dict]]:
         """
         Return top-ranked pages that are NOT seeds.
         These are the things you discovered by crawling outward.
 
+        When use_quality=True, the final score is pagerank * quality_score.
+        This demotes spammy/script-heavy pages even if they have good link authority.
+
         Args:
-            top_n:      Number of discoveries to return
-            damping:    PageRank damping factor (0.95 = follow links deep,
-                        0.5 = stay close to seeds)
-            iterations: PageRank iterations (50 is usually plenty)
+            top_n:       Number of discoveries to return
+            damping:     PageRank damping factor (0.95 = follow links deep,
+                         0.5 = stay close to seeds)
+            iterations:  PageRank iterations (50 is usually plenty)
+            use_quality: Multiply by quality score to penalize spam
         """
         ranks = self.pagerank(damping=damping, iterations=iterations)
         results = []
         for url, score in ranks.items():
             if url not in self.seeds and url in self.nodes:
-                results.append((url, score, self.nodes[url]))
+                if use_quality:
+                    q = self.nodes[url].get("quality", 1.0)
+                    final_score = score * q
+                else:
+                    final_score = score
+                results.append((url, final_score, self.nodes[url]))
+        # Re-sort by final score after quality weighting
+        results.sort(key=lambda x: x[1], reverse=True)
         return results[:top_n]
+
+    def _build_inbound_index(self) -> Dict[str, Set[str]]:
+        """
+        Build reverse index: domain -> set of domains that link TO it.
+        Only counts cross-domain links (self-links within a domain don't count).
+        """
+        inbound: Dict[str, Set[str]] = defaultdict(set)
+        for from_url, to_urls in self.edges.items():
+            from_domain = urlparse(from_url).netloc.lower()
+            for to_url in to_urls:
+                to_domain = urlparse(to_url).netloc.lower()
+                if from_domain != to_domain:  # external links only
+                    inbound[to_domain].add(from_domain)
+        return inbound
+
+    def similar_sites(self, target: str, top_n: int = 20) -> List[Tuple[str, float, int]]:
+        """
+        Find sites similar to target using co-citation analysis.
+
+        Two domains are similar if they're linked FROM the same sources.
+        Uses cosine similarity on binary inbound-link vectors.
+
+        Args:
+            target: URL or domain to find similar sites for
+            top_n:  Number of results to return
+
+        Returns:
+            List of (domain, cosine_similarity, shared_sources_count)
+        """
+        # Accept either URL or bare domain
+        target_domain = urlparse(target).netloc.lower() if "://" in target else target.lower()
+
+        inbound = self._build_inbound_index()
+        target_sources = inbound.get(target_domain, set())
+        if not target_sources:
+            return []
+
+        similarities = []
+        for domain, sources in inbound.items():
+            if domain == target_domain:
+                continue
+            intersection = len(target_sources & sources)
+            if intersection == 0:
+                continue
+            cosine = intersection / (len(target_sources) ** 0.5 * len(sources) ** 0.5)
+            similarities.append((domain, cosine, intersection))
+
+        return sorted(similarities, key=lambda x: x[1], reverse=True)[:top_n]
+
+    def all_similarities(self, min_shared: int = 2, top_n: int = 50) -> List[Tuple[str, str, float, int]]:
+        """
+        Find all pairs of similar domains in the graph.
+
+        Args:
+            min_shared: Minimum shared sources to include a pair
+            top_n:      Maximum pairs to return
+
+        Returns:
+            List of (domain_a, domain_b, cosine_similarity, shared_count)
+        """
+        inbound = self._build_inbound_index()
+        # Only consider domains with at least min_shared inbound sources
+        domains = {d: s for d, s in inbound.items() if len(s) >= min_shared}
+        domain_list = list(domains.keys())
+
+        pairs = []
+        for i in range(len(domain_list)):
+            for j in range(i + 1, len(domain_list)):
+                d_a, d_b = domain_list[i], domain_list[j]
+                intersection = len(domains[d_a] & domains[d_b])
+                if intersection < min_shared:
+                    continue
+                cosine = intersection / (len(domains[d_a]) ** 0.5 * len(domains[d_b]) ** 0.5)
+                pairs.append((d_a, d_b, cosine, intersection))
+
+        return sorted(pairs, key=lambda x: x[2], reverse=True)[:top_n]
 
     def domains(self) -> Dict[str, int]:
         """Count pages per domain."""
@@ -343,8 +453,14 @@ async def fetch_page(session: aiohttp.ClientSession, url: str, timeout: int = 10
         return None
 
 
-def extract_links_and_meta(html: str, base_url: str) -> Tuple[str, str, List[str]]:
-    """Extract title, description, and outgoing links from HTML."""
+def extract_links_and_meta(html: str, base_url: str) -> Tuple[str, str, List[str], Dict[str, List[str]]]:
+    """
+    Extract title, description, outgoing links, and anchor texts from HTML.
+
+    Returns:
+        (title, description, links, anchor_texts)
+        where anchor_texts is {target_url: [list of anchor text strings]}
+    """
     soup = BeautifulSoup(html, "html.parser")
 
     # Title
@@ -358,8 +474,9 @@ def extract_links_and_meta(html: str, base_url: str) -> Tuple[str, str, List[str
     if meta_desc and meta_desc.get("content"):
         description = meta_desc["content"].strip()[:300]
 
-    # Links
+    # Links + anchor text
     links = []
+    anchor_texts: Dict[str, List[str]] = defaultdict(list)
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
         if not href or href.startswith("#") or href.startswith("javascript:") or href.startswith("mailto:"):
@@ -368,10 +485,90 @@ def extract_links_and_meta(html: str, base_url: str) -> Tuple[str, str, List[str
             absolute = urljoin(base_url, href)
             if not should_skip_url(absolute):
                 links.append(absolute)
+                # Capture anchor text — what this page calls the linked page
+                text = a.get_text(strip=True)[:100]
+                if text and text.lower() not in ("click here", "here", "link", "read more", "more", "→", "»"):
+                    anchor_texts[absolute].append(text)
         except:
             continue
 
-    return title, description, links
+    return title, description, links, anchor_texts
+
+
+def quality_score(html: str, soup: BeautifulSoup) -> float:
+    """
+    Compute a simple quality score for a page (0.0 to 1.0).
+
+    Signals (from Marginalia's approach):
+    - Script tag count: many scripts = commercial/heavy
+    - Text-to-HTML ratio: low ratio = boilerplate-heavy
+    - Link density: high ratio of links to text = link farm
+    - Tracker detection: known tracking domains in script srcs
+
+    Returns a float between 0.0 (spam) and 1.0 (clean content).
+    """
+    text = soup.get_text()
+    text_len = len(text)
+    html_len = max(len(html), 1)
+
+    # Script count
+    scripts = soup.find_all("script")
+    script_count = len(scripts)
+
+    # External script domains (tracker signal)
+    tracker_domains = {
+        "google-analytics.com", "googletagmanager.com", "facebook.net",
+        "doubleclick.net", "hotjar.com", "segment.com", "mixpanel.com",
+        "amplitude.com", "optimizely.com", "crazyegg.com", "hubspot.com",
+    }
+    external_trackers = 0
+    for s in scripts:
+        src = s.get("src", "")
+        if src:
+            src_domain = urlparse(src).netloc.lower()
+            for tracker in tracker_domains:
+                if tracker in src_domain:
+                    external_trackers += 1
+                    break
+
+    # Text density
+    text_ratio = text_len / html_len
+
+    # Link density (outlinks per word)
+    outlinks = len(soup.find_all("a", href=True))
+    text_words = max(len(text.split()), 1)
+    link_density = outlinks / text_words
+
+    # Scoring
+    score = 1.0
+
+    # Penalize script-heavy pages
+    if script_count > 15:
+        score *= 0.3
+    elif script_count > 10:
+        score *= 0.5
+    elif script_count > 5:
+        score *= 0.8
+
+    # Penalize tracker-laden pages
+    if external_trackers >= 3:
+        score *= 0.4
+    elif external_trackers >= 1:
+        score *= 0.7
+
+    # Penalize boilerplate-heavy pages
+    if text_ratio < 0.05:
+        score *= 0.4
+    elif text_ratio < 0.1:
+        score *= 0.6
+
+    # Penalize link farms
+    if link_density > 0.5:
+        score *= 0.3
+    elif link_density > 0.3:
+        score *= 0.6
+
+    return round(max(0.0, min(1.0, score)), 3)
 
 
 def _get_domain(url: str) -> str:
@@ -491,15 +688,36 @@ async def crawl(seeds: List[str], max_hops: int = 2, max_pages: int = 200,
                 domain = _get_domain(final_url)
                 domain_counts[domain] += 1
 
-                title, description, links = extract_links_and_meta(html, final_url)
-                graph.add_node(final_url, title=title, description=description, depth=depth)
+                title, description, links, anchors = extract_links_and_meta(html, final_url)
 
-                # Add edges and queue new URLs
+                # Compute quality score
+                soup = BeautifulSoup(html, "html.parser")
+                q_score = quality_score(html, soup)
+
+                graph.add_node(final_url, title=title, description=description, depth=depth)
+                graph.nodes[graph._normalize_url(final_url)]["quality"] = q_score
+
+                # Add edges, queue new URLs, and store anchor texts
                 for link in links:
                     graph.add_edge(final_url, link)
                     link_norm = graph._normalize_url(link)
+
+                    # Store anchor texts on the target node
+                    if link in anchors:
+                        if link_norm not in graph.nodes:
+                            graph.add_node(link, depth=depth + 1)
+                        node = graph.nodes[link_norm]
+                        if "anchor_texts" not in node:
+                            node["anchor_texts"] = []
+                        for text in anchors[link]:
+                            if text not in node["anchor_texts"]:
+                                node["anchor_texts"].append(text)
+                        # Keep list bounded
+                        node["anchor_texts"] = node["anchor_texts"][:20]
+
                     if link_norm not in visited and depth + 1 <= max_hops:
-                        graph.add_node(link, depth=depth + 1)
+                        if link_norm not in graph.nodes:
+                            graph.add_node(link, depth=depth + 1)
                         queue.append((link, depth + 1))
 
                 # Show progress with domain count
@@ -747,6 +965,18 @@ def main():
     serve_p.add_argument("graph", help="Graph JSON file")
     serve_p.add_argument("--port", "-p", type=int, default=8080, help="Port (default: 8080)")
 
+    # similar (find sites similar to a given URL/domain)
+    sim_p = subparsers.add_parser("similar", help="Find similar sites via co-citation")
+    sim_p.add_argument("graph", help="Graph JSON file")
+    sim_p.add_argument("target", help="URL or domain to find similar sites for")
+    sim_p.add_argument("--top", "-n", type=int, default=20, help="Top N results")
+
+    # similarities (find all similar pairs in graph)
+    sims_p = subparsers.add_parser("similarities", help="Find all similar domain pairs")
+    sims_p.add_argument("graph", help="Graph JSON file")
+    sims_p.add_argument("--min-shared", type=int, default=2, help="Min shared sources (default: 2)")
+    sims_p.add_argument("--top", "-n", type=int, default=50, help="Top N pairs")
+
     # export-html
     html_p = subparsers.add_parser("html", help="Export static HTML")
     html_p.add_argument("graph", help="Graph JSON file")
@@ -865,6 +1095,28 @@ def main():
     elif args.command == "serve":
         graph = WebGraph.load(args.graph)
         asyncio.run(serve(graph, port=args.port, graph_file=args.graph))
+
+    elif args.command == "similar":
+        graph = WebGraph.load(args.graph)
+        results = graph.similar_sites(args.target, top_n=args.top)
+        target_display = urlparse(args.target).netloc if "://" in args.target else args.target
+        if not results:
+            print(f"no similar sites found for {target_display}")
+            print("(needs cross-domain links — try crawling with more hops)")
+        else:
+            print(f"sites similar to {target_display} (by co-citation):\n")
+            for i, (domain, cosine, shared) in enumerate(results):
+                print(f"  {i+1:3d}. {cosine:.3f}  {domain}  ({shared} shared sources)")
+
+    elif args.command == "similarities":
+        graph = WebGraph.load(args.graph)
+        pairs = graph.all_similarities(min_shared=args.min_shared, top_n=args.top)
+        if not pairs:
+            print(f"no similar pairs found (min {args.min_shared} shared sources)")
+        else:
+            print(f"similar domain pairs (min {args.min_shared} shared sources):\n")
+            for i, (d_a, d_b, cosine, shared) in enumerate(pairs):
+                print(f"  {i+1:3d}. {cosine:.3f}  {d_a}  ↔  {d_b}  ({shared} shared)")
 
     elif args.command == "html":
         graph = WebGraph.load(args.graph)

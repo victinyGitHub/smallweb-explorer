@@ -289,8 +289,10 @@ async def handle_discoveries(request):
         return web.json_response({"error": "graph not found"}, status=404)
 
     top = int(request.query.get("top", 30))
+    damping = float(request.query.get("damping", 0.95))
+    iterations = int(request.query.get("iterations", 50))
     graph = WebGraph.load(str(path))
-    discoveries = graph.discoveries(top_n=top)
+    discoveries = graph.discoveries(top_n=top, damping=damping, iterations=iterations)
 
     results = []
     for url, score, node in discoveries:
@@ -300,9 +302,55 @@ async def handle_discoveries(request):
             "title": node.get("title", ""),
             "description": node.get("description", ""),
             "domain": node.get("domain", ""),
+            "quality": node.get("quality", 1.0),
+            "anchor_texts": node.get("anchor_texts", []),
         })
 
     return web.json_response({"discoveries": results, "total": len(results)})
+
+
+async def handle_similar(request):
+    """Find sites similar to a target domain via co-citation."""
+    graph_id = request.match_info["id"]
+    path = GRAPHS_DIR / f"{graph_id}.json"
+    if not path.exists():
+        return web.json_response({"error": "graph not found"}, status=404)
+
+    target = request.query.get("target", "")
+    if not target:
+        return web.json_response({"error": "target parameter required"}, status=400)
+
+    top = int(request.query.get("top", 20))
+    graph = WebGraph.load(str(path))
+    results = graph.similar_sites(target, top_n=top)
+
+    return web.json_response({
+        "target": target,
+        "similar": [
+            {"domain": domain, "similarity": round(cosine, 4), "shared_sources": shared}
+            for domain, cosine, shared in results
+        ],
+    })
+
+
+async def handle_similarities(request):
+    """Find all similar domain pairs in a graph."""
+    graph_id = request.match_info["id"]
+    path = GRAPHS_DIR / f"{graph_id}.json"
+    if not path.exists():
+        return web.json_response({"error": "graph not found"}, status=404)
+
+    min_shared = int(request.query.get("min_shared", 2))
+    top = int(request.query.get("top", 50))
+    graph = WebGraph.load(str(path))
+    pairs = graph.all_similarities(min_shared=min_shared, top_n=top)
+
+    return web.json_response({
+        "pairs": [
+            {"domain_a": d_a, "domain_b": d_b, "similarity": round(cosine, 4), "shared_sources": shared}
+            for d_a, d_b, cosine, shared in pairs
+        ],
+    })
 
 
 def create_app():
@@ -313,6 +361,8 @@ def create_app():
     app.router.add_get("/api/graphs/{id}", handle_get_graph)
     app.router.add_get("/api/graphs/{id}/html", handle_graph_html)
     app.router.add_get("/api/graphs/{id}/discoveries", handle_discoveries)
+    app.router.add_get("/api/graphs/{id}/similar", handle_similar)
+    app.router.add_get("/api/graphs/{id}/similarities", handle_similarities)
     app.router.add_post("/api/graphs/{id}/fork", handle_fork)
     app.router.add_post("/api/crawl", handle_start_crawl)
     app.router.add_get("/api/crawl/{id}", handle_crawl_status)
