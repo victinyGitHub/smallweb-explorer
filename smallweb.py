@@ -154,7 +154,8 @@ class WebGraph:
         return dict(sorted(result.items(), key=lambda x: x[1], reverse=True))
 
     def discoveries(self, top_n: int = 20, damping: float = 0.95,
-                     iterations: int = 50, use_quality: bool = True) -> List[Tuple[str, float, dict]]:
+                     iterations: int = 50, use_quality: bool = True,
+                     personalized: bool = True) -> List[Tuple[str, float, dict]]:
         """
         Return top-ranked pages that are NOT seeds.
         These are the things you discovered by crawling outward.
@@ -163,13 +164,14 @@ class WebGraph:
         This demotes spammy/script-heavy pages even if they have good link authority.
 
         Args:
-            top_n:       Number of discoveries to return
-            damping:     PageRank damping factor (0.95 = follow links deep,
-                         0.5 = stay close to seeds)
-            iterations:  PageRank iterations (50 is usually plenty)
-            use_quality: Multiply by quality score to penalize spam
+            top_n:        Number of discoveries to return
+            damping:      PageRank damping factor (0.95 = follow links deep,
+                          0.5 = stay close to seeds)
+            iterations:   PageRank iterations (50 is usually plenty)
+            use_quality:  Multiply by quality score to penalize spam
+            personalized: Use personalized pagerank (biased toward seeds)
         """
-        ranks = self.pagerank(damping=damping, iterations=iterations)
+        ranks = self.pagerank(damping=damping, iterations=iterations, personalized=personalized)
         results = []
         for url, score in ranks.items():
             if url not in self.seeds and url in self.nodes:
@@ -743,34 +745,126 @@ SERVE_HTML = """<!DOCTYPE html>
 <title>smallweb - $name</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: 'Berkeley Mono', 'IBM Plex Mono', monospace; background: #0a0a0a; color: #e0e0e0; padding: 2rem; max-width: 900px; margin: 0 auto; }
-  h1 { color: #fff; margin-bottom: 0.5rem; font-size: 1.4rem; }
-  .meta { color: #666; font-size: 0.85rem; margin-bottom: 2rem; }
-  .stats { display: flex; gap: 2rem; margin-bottom: 2rem; }
-  .stat { background: #151515; padding: 1rem; border-radius: 8px; border: 1px solid #222; }
-  .stat-value { font-size: 1.5rem; color: #fff; }
-  .stat-label { font-size: 0.75rem; color: #666; text-transform: uppercase; letter-spacing: 0.05em; }
+  body { font-family: 'Berkeley Mono', 'IBM Plex Mono', monospace; background: #0a0a0a; color: #e0e0e0; padding: 2rem; max-width: 960px; margin: 0 auto; }
+  a { color: #4fc3f7; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  h1 { color: #fff; margin-bottom: 0.3rem; font-size: 1.4rem; }
+  h1 .back { color: #555; font-size: 0.85rem; margin-right: 0.5rem; text-decoration: none; }
+  h1 .back:hover { color: #4fc3f7; }
+  .meta { color: #555; font-size: 0.8rem; margin-bottom: 2rem; }
+
+  /* Stats row */
+  .stats { display: flex; gap: 1rem; margin-bottom: 2rem; flex-wrap: wrap; }
+  .stat { background: #111; padding: 0.8rem 1rem; border-radius: 8px; border: 1px solid #1a1a1a; }
+  .stat-value { font-size: 1.3rem; color: #fff; font-weight: 600; }
+  .stat-label { font-size: 0.65rem; color: #555; text-transform: uppercase; letter-spacing: 0.05em; }
+
+  /* Tabs */
+  .tabs { display: flex; gap: 0; margin-bottom: 1.5rem; border-bottom: 1px solid #222; }
+  .tab { padding: 0.6rem 1.2rem; font-size: 0.85rem; color: #666; cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.2s; font-family: inherit; background: none; border-top: none; border-left: none; border-right: none; }
+  .tab:hover { color: #aaa; }
+  .tab.active { color: #4fc3f7; border-bottom-color: #4fc3f7; }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+
+  /* Controls bar */
+  .controls { display: flex; gap: 1rem; align-items: center; margin-bottom: 1.2rem; flex-wrap: wrap; }
+  .toggle-group { display: flex; background: #151515; border: 1px solid #222; border-radius: 6px; overflow: hidden; }
+  .toggle-btn { padding: 0.4rem 0.8rem; font-size: 0.75rem; color: #666; cursor: pointer; border: none; background: none; font-family: inherit; transition: all 0.2s; }
+  .toggle-btn.active { background: #1a3050; color: #4fc3f7; }
+  .toggle-btn:hover:not(.active) { color: #aaa; }
+  .control-label { font-size: 0.7rem; color: #555; text-transform: uppercase; letter-spacing: 0.04em; }
+
+  /* Section headers */
   .section { margin-bottom: 2rem; }
-  .section h2 { font-size: 1rem; color: #888; margin-bottom: 1rem; border-bottom: 1px solid #222; padding-bottom: 0.5rem; }
-  .discovery { padding: 0.8rem 0; border-bottom: 1px solid #1a1a1a; }
-  .discovery:hover { background: #111; margin: 0 -0.5rem; padding: 0.8rem 0.5rem; border-radius: 4px; }
-  .discovery-title { color: #4fc3f7; text-decoration: none; font-size: 0.95rem; }
+  .section h2 { font-size: 0.9rem; color: #888; margin-bottom: 1rem; border-bottom: 1px solid #1a1a1a; padding-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.05em; }
+
+  /* Discovery cards */
+  .discovery { padding: 0.8rem; margin-bottom: 0.5rem; border: 1px solid #1a1a1a; border-radius: 8px; transition: border-color 0.2s; position: relative; }
+  .discovery:hover { border-color: #333; background: #0d0d0d; }
+  .discovery-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }
+  .discovery-main { flex: 1; min-width: 0; }
+  .discovery-title { color: #4fc3f7; text-decoration: none; font-size: 0.9rem; display: block; }
   .discovery-title:hover { text-decoration: underline; }
-  .discovery-url { color: #555; font-size: 0.75rem; margin-top: 0.2rem; }
-  .discovery-desc { color: #888; font-size: 0.8rem; margin-top: 0.3rem; }
-  .discovery-score { color: #333; font-size: 0.7rem; float: right; }
-  .domain-list { display: flex; flex-wrap: wrap; gap: 0.5rem; }
-  .domain-tag { background: #1a1a1a; border: 1px solid #2a2a2a; padding: 0.3rem 0.6rem; border-radius: 4px; font-size: 0.8rem; color: #aaa; }
+  .discovery-url { color: #444; font-size: 0.7rem; margin-top: 0.15rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .discovery-desc { color: #777; font-size: 0.78rem; margin-top: 0.4rem; line-height: 1.4; }
+
+  /* Quality bar */
+  .quality-bar-wrap { display: flex; align-items: center; gap: 0.5rem; flex-shrink: 0; }
+  .quality-bar { width: 60px; height: 6px; background: #1a1a1a; border-radius: 3px; overflow: hidden; }
+  .quality-bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+  .quality-label { font-size: 0.65rem; color: #555; min-width: 28px; text-align: right; }
+
+  /* Anchor text pills */
+  .anchor-texts { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.5rem; }
+  .anchor-pill { background: #151520; border: 1px solid #252535; padding: 0.15rem 0.5rem; border-radius: 10px; font-size: 0.68rem; color: #8888bb; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* Score badge */
+  .score-badge { font-size: 0.65rem; color: #333; font-weight: 600; white-space: nowrap; }
+
+  /* Similar button */
+  .btn-similar { background: none; border: 1px solid #222; color: #666; font-size: 0.68rem; padding: 0.2rem 0.5rem; border-radius: 4px; cursor: pointer; font-family: inherit; transition: all 0.2s; margin-top: 0.4rem; }
+  .btn-similar:hover { border-color: #4fc3f7; color: #4fc3f7; }
+
+  /* Similarity explorer */
+  .sim-explorer { background: #111; border: 1px solid #222; border-radius: 10px; padding: 1.5rem; margin-bottom: 2rem; }
+  .sim-search { display: flex; gap: 0.8rem; margin-bottom: 1rem; }
+  .sim-search input { flex: 1; background: #0a0a0a; border: 1px solid #2a2a2a; border-radius: 6px; padding: 0.5rem 0.8rem; color: #e0e0e0; font-family: inherit; font-size: 0.85rem; outline: none; }
+  .sim-search input:focus { border-color: #4fc3f7; }
+  .sim-search input::placeholder { color: #333; }
+  .btn { background: #4fc3f7; color: #000; border: none; border-radius: 6px; padding: 0.5rem 1rem; font-family: inherit; font-size: 0.85rem; font-weight: 600; cursor: pointer; }
+  .btn:hover { background: #81d4fa; }
+  .btn:disabled { background: #333; color: #666; cursor: not-allowed; }
+  .btn-sm { padding: 0.3rem 0.7rem; font-size: 0.75rem; }
+
+  .sim-results { max-height: 400px; overflow-y: auto; }
+  .sim-result { display: flex; align-items: center; gap: 0.8rem; padding: 0.5rem 0; border-bottom: 1px solid #1a1a1a; }
+  .sim-result:last-child { border-bottom: none; }
+  .sim-bar-wrap { width: 80px; flex-shrink: 0; }
+  .sim-bar { height: 4px; background: #1a1a1a; border-radius: 2px; overflow: hidden; }
+  .sim-bar-fill { height: 100%; background: #81c784; border-radius: 2px; }
+  .sim-score { font-size: 0.75rem; color: #81c784; min-width: 40px; font-weight: 600; }
+  .sim-domain { font-size: 0.85rem; color: #e0e0e0; flex: 1; }
+  .sim-shared { font-size: 0.7rem; color: #555; }
+
+  /* All-pairs similarity */
+  .pair-grid { display: grid; grid-template-columns: 1fr; gap: 0.3rem; }
+  .pair { display: flex; align-items: center; gap: 0.6rem; padding: 0.4rem 0.6rem; border-radius: 6px; font-size: 0.8rem; }
+  .pair:hover { background: #111; }
+  .pair-score { color: #81c784; font-weight: 600; min-width: 40px; font-size: 0.75rem; }
+  .pair-arrow { color: #333; }
+  .pair-domain { color: #e0e0e0; cursor: pointer; }
+  .pair-domain:hover { color: #4fc3f7; }
+
+  /* Seeds */
   .seeds { list-style: none; }
   .seeds li { padding: 0.3rem 0; }
   .seeds a { color: #81c784; text-decoration: none; font-size: 0.85rem; }
   .seeds a:hover { text-decoration: underline; }
-  .fork-info { background: #1a1510; border: 1px solid #332a15; padding: 1rem; border-radius: 8px; margin-bottom: 2rem; font-size: 0.85rem; color: #aa8844; }
-  pre { background: #111; padding: 1rem; border-radius: 4px; overflow-x: auto; font-size: 0.8rem; margin-top: 1rem; }
+
+  /* Domain tags */
+  .domain-list { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+  .domain-tag { background: #151515; border: 1px solid #1a1a1a; padding: 0.25rem 0.6rem; border-radius: 4px; font-size: 0.75rem; color: #888; cursor: pointer; transition: all 0.2s; }
+  .domain-tag:hover { border-color: #4fc3f7; color: #4fc3f7; }
+
+  /* Fork info */
+  .fork-info { background: #1a1510; border: 1px solid #332a15; padding: 0.8rem 1rem; border-radius: 8px; margin-bottom: 1.5rem; font-size: 0.8rem; color: #aa8844; }
+
+  /* Loading */
+  .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid #333; border-top-color: #4fc3f7; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 0.4rem; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .loading { color: #555; font-size: 0.85rem; padding: 1rem 0; }
+
+  /* Empty state */
+  .empty { color: #444; font-size: 0.85rem; padding: 1rem 0; }
+
+  /* Footer */
+  footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #1a1a1a; color: #333; font-size: 0.7rem; }
 </style>
 </head>
 <body>
-  <h1>smallweb / $name</h1>
+  <h1><a class="back" href="/smallweb/">&larr;</a>smallweb / $name</h1>
   <div class="meta">$description</div>
 
   <div class="stats">
@@ -780,70 +874,314 @@ SERVE_HTML = """<!DOCTYPE html>
     <div class="stat"><div class="stat-value">$n_domains</div><div class="stat-label">domains</div></div>
   </div>
 
-  <div class="section">
-    <h2>discoveries (ranked by local pagerank)</h2>
-    $discoveries_html
+  <!-- Tabs -->
+  <div class="tabs">
+    <button class="tab active" data-tab="discoveries">discoveries</button>
+    <button class="tab" data-tab="similarity">similarity</button>
+    <button class="tab" data-tab="seeds">seeds & domains</button>
   </div>
 
-  <div class="section">
-    <h2>seeds</h2>
-    <ul class="seeds">$seeds_html</ul>
+  <!-- Tab: Discoveries -->
+  <div class="tab-panel active" id="tab-discoveries">
+    <div class="controls">
+      <div>
+        <div class="control-label">ranking</div>
+        <div class="toggle-group">
+          <button class="toggle-btn active" data-rank="personalized" onclick="switchRank('personalized')">personalized</button>
+          <button class="toggle-btn" data-rank="standard" onclick="switchRank('standard')">standard</button>
+        </div>
+      </div>
+      <div>
+        <div class="control-label">sort by</div>
+        <div class="toggle-group">
+          <button class="toggle-btn active" data-sort="score" onclick="switchSort('score')">pagerank</button>
+          <button class="toggle-btn" data-sort="quality" onclick="switchSort('quality')">quality</button>
+          <button class="toggle-btn" data-sort="blended" onclick="switchSort('blended')">blended</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="discoveriesContainer">
+      <div class="loading"><span class="spinner"></span>loading discoveries...</div>
+    </div>
   </div>
 
-  <div class="section">
-    <h2>domains</h2>
-    <div class="domain-list">$domains_html</div>
+  <!-- Tab: Similarity -->
+  <div class="tab-panel" id="tab-similarity">
+    <div class="sim-explorer">
+      <h2 style="border:none;padding:0;margin-bottom:0.8rem">find similar sites</h2>
+      <p style="color:#555;font-size:0.78rem;margin-bottom:1rem">enter a domain to find sites with similar inbound link patterns (co-citation)</p>
+      <div class="sim-search">
+        <input type="text" id="simTarget" placeholder="e.g. 100r.co or wiki.xxiivv.com" onkeydown="if(event.key==='Enter')findSimilar()">
+        <button class="btn btn-sm" onclick="findSimilar()">search</button>
+      </div>
+      <div id="simResults"></div>
+    </div>
+
+    <div class="section">
+      <h2>top similar pairs</h2>
+      <div id="pairsContainer">
+        <div class="loading"><span class="spinner"></span>computing similarities...</div>
+      </div>
+    </div>
   </div>
 
-  <div class="section">
-    <h2>fork this graph</h2>
-    <pre>smallweb fork $graph_file --output my-fork.json
-smallweb crawl my-fork.json --hops 2  # crawl deeper
-smallweb merge my-graph.json friend-graph.json --output combined.json</pre>
+  <!-- Tab: Seeds & Domains -->
+  <div class="tab-panel" id="tab-seeds">
+    <div class="section">
+      <h2>seeds ($n_seeds)</h2>
+      <ul class="seeds">$seeds_html</ul>
+    </div>
+    <div class="section">
+      <h2>domains ($n_domains)</h2>
+      <div class="domain-list">$domains_html</div>
+    </div>
   </div>
+
+  <footer>
+    <a href="/smallweb/">smallweb</a> &mdash; graph: $graph_id
+  </footer>
+
+<script>
+const GRAPH_ID = '$graph_id';
+const API = '/smallweb/api';
+
+let currentSort = 'score';
+let currentRank = 'personalized';
+let discoveriesCache = { personalized: null, standard: null };
+
+// ── Tabs ──
+
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+
+    // Lazy-load similarity pairs
+    if (tab.dataset.tab === 'similarity' && !document.getElementById('pairsContainer').dataset.loaded) {
+      loadPairs();
+    }
+  });
+});
+
+// ── Discoveries ──
+
+async function loadDiscoveries(rank) {
+  const key = rank || currentRank;
+  if (discoveriesCache[key]) {
+    renderDiscoveries(discoveriesCache[key]);
+    return;
+  }
+
+  const container = document.getElementById('discoveriesContainer');
+  container.innerHTML = '<div class="loading"><span class="spinner"></span>loading discoveries...</div>';
+
+  try {
+    const personalized = key === 'personalized' ? 'true' : 'false';
+    const url = API + '/graphs/' + GRAPH_ID + '/discoveries?top=50&personalized=' + personalized;
+    const res = await fetch(url);
+    const data = await res.json();
+    discoveriesCache[key] = data.discoveries || [];
+    renderDiscoveries(discoveriesCache[key]);
+  } catch (e) {
+    container.innerHTML = '<div class="empty">error loading discoveries: ' + e.message + '</div>';
+  }
+}
+
+function renderDiscoveries(discoveries) {
+  const container = document.getElementById('discoveriesContainer');
+
+  // Sort
+  let sorted = [...discoveries];
+  if (currentSort === 'quality') {
+    sorted.sort((a, b) => (b.quality || 0) - (a.quality || 0));
+  } else if (currentSort === 'blended') {
+    sorted.sort((a, b) => ((b.score || 0) * (b.quality || 1)) - ((a.score || 0) * (a.quality || 1)));
+  }
+  // 'score' is already default order from API
+
+  if (sorted.length === 0) {
+    container.innerHTML = '<div class="empty">no discoveries yet &mdash; try crawling with more hops</div>';
+    return;
+  }
+
+  container.innerHTML = sorted.map((d, i) => {
+    const title = d.title || new URL(d.url).hostname;
+    const quality = d.quality != null ? d.quality : 1.0;
+    const qColor = quality >= 0.7 ? '#81c784' : quality >= 0.4 ? '#ffb74d' : '#ef5350';
+    const qPct = Math.round(quality * 100);
+    const domain = d.domain || new URL(d.url).hostname;
+
+    // Anchor text pills (max 5)
+    const anchors = (d.anchor_texts || []).slice(0, 5);
+    const anchorHtml = anchors.length > 0
+      ? '<div class="anchor-texts">' + anchors.map(a => '<span class="anchor-pill" title="' + escHtml(a) + '">' + escHtml(a) + '</span>').join('') + '</div>'
+      : '';
+
+    return '<div class="discovery">' +
+      '<div class="discovery-header">' +
+        '<div class="discovery-main">' +
+          '<a class="discovery-title" href="' + d.url + '" target="_blank">' + escHtml(title) + '</a>' +
+          '<div class="discovery-url">' + escHtml(d.url) + '</div>' +
+          (d.description ? '<div class="discovery-desc">' + escHtml(d.description.slice(0, 150)) + '</div>' : '') +
+          anchorHtml +
+          '<button class="btn-similar" onclick="findSimilarFrom(\\'' + escJs(domain) + '\\')">find similar &rarr;</button>' +
+        '</div>' +
+        '<div style="text-align:right">' +
+          '<div class="quality-bar-wrap" title="quality: ' + qPct + '%">' +
+            '<div class="quality-bar"><div class="quality-bar-fill" style="width:' + qPct + '%;background:' + qColor + '"></div></div>' +
+            '<span class="quality-label" style="color:' + qColor + '">' + qPct + '</span>' +
+          '</div>' +
+          '<div class="score-badge">#' + (i + 1) + ' &middot; ' + d.score.toFixed(4) + '</div>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+}
+
+function switchRank(rank) {
+  currentRank = rank;
+  document.querySelectorAll('[data-rank]').forEach(b => b.classList.toggle('active', b.dataset.rank === rank));
+  loadDiscoveries(rank);
+}
+
+function switchSort(sort) {
+  currentSort = sort;
+  document.querySelectorAll('[data-sort]').forEach(b => b.classList.toggle('active', b.dataset.sort === sort));
+  const cached = discoveriesCache[currentRank];
+  if (cached) renderDiscoveries(cached);
+}
+
+// ── Similarity ──
+
+async function findSimilar(target) {
+  const domain = target || document.getElementById('simTarget').value.trim();
+  if (!domain) return;
+
+  document.getElementById('simTarget').value = domain;
+  const container = document.getElementById('simResults');
+  container.innerHTML = '<div class="loading"><span class="spinner"></span>finding similar sites...</div>';
+
+  // Switch to similarity tab
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === 'similarity'));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'tab-similarity'));
+
+  try {
+    const res = await fetch(API + '/graphs/' + GRAPH_ID + '/similar?target=' + encodeURIComponent(domain) + '&top=20');
+    const data = await res.json();
+
+    if (!data.similar || data.similar.length === 0) {
+      container.innerHTML = '<div class="empty">no similar sites found for ' + escHtml(domain) + ' &mdash; needs cross-domain links (try more hops)</div>';
+      return;
+    }
+
+    container.innerHTML = '<div class="sim-results">' + data.similar.map(s => {
+      const pct = Math.round(s.similarity * 100);
+      return '<div class="sim-result">' +
+        '<span class="sim-score">' + (s.similarity).toFixed(2) + '</span>' +
+        '<div class="sim-bar-wrap"><div class="sim-bar"><div class="sim-bar-fill" style="width:' + pct + '%"></div></div></div>' +
+        '<span class="sim-domain pair-domain" onclick="findSimilar(\\'' + escJs(s.domain) + '\\')">' + escHtml(s.domain) + '</span>' +
+        '<span class="sim-shared">' + s.shared_sources + ' shared</span>' +
+      '</div>';
+    }).join('') + '</div>';
+  } catch (e) {
+    container.innerHTML = '<div class="empty">error: ' + e.message + '</div>';
+  }
+}
+
+function findSimilarFrom(domain) {
+  findSimilar(domain);
+}
+
+async function loadPairs() {
+  const container = document.getElementById('pairsContainer');
+  container.dataset.loaded = 'true';
+
+  try {
+    const res = await fetch(API + '/graphs/' + GRAPH_ID + '/similarities?min_shared=2&top=30');
+    const data = await res.json();
+
+    if (!data.pairs || data.pairs.length === 0) {
+      container.innerHTML = '<div class="empty">no similar pairs found &mdash; needs more cross-domain links</div>';
+      return;
+    }
+
+    container.innerHTML = '<div class="pair-grid">' + data.pairs.map(p => {
+      return '<div class="pair">' +
+        '<span class="pair-score">' + p.similarity.toFixed(2) + '</span>' +
+        '<span class="pair-domain" onclick="findSimilar(\\'' + escJs(p.domain_a) + '\\')">' + escHtml(p.domain_a) + '</span>' +
+        '<span class="pair-arrow">&harr;</span>' +
+        '<span class="pair-domain" onclick="findSimilar(\\'' + escJs(p.domain_b) + '\\')">' + escHtml(p.domain_b) + '</span>' +
+        '<span class="sim-shared">' + p.shared_sources + ' shared</span>' +
+      '</div>';
+    }).join('') + '</div>';
+  } catch (e) {
+    container.innerHTML = '<div class="empty">error: ' + e.message + '</div>';
+  }
+}
+
+// ── Domain tag clicks → similarity ──
+
+document.querySelectorAll('.domain-tag').forEach(tag => {
+  tag.addEventListener('click', () => {
+    const domain = tag.textContent.split(' (')[0].trim();
+    findSimilar(domain);
+  });
+});
+
+// ── Helpers ──
+
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function escJs(s) {
+  return s.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'");
+}
+
+// ── Init ──
+loadDiscoveries();
+</script>
 </body>
 </html>"""
 
 
-def render_html(graph: WebGraph, graph_file: str = "graph.json") -> str:
+def render_html(graph: WebGraph, graph_file: str = "graph.json", graph_id: str = "") -> str:
     """Render the graph as an HTML page."""
     from string import Template
+    import html as html_module
 
     stats = graph.stats()
-    discoveries = graph.discoveries(top_n=50)
 
-    discoveries_html = ""
-    for url, score, node in discoveries:
-        title = node.get("title") or urlparse(url).netloc
-        desc = node.get("description", "")
-        discoveries_html += f"""<div class="discovery">
-            <span class="discovery-score">{score:.6f}</span>
-            <a class="discovery-title" href="{url}" target="_blank">{title}</a>
-            <div class="discovery-url">{url}</div>
-            {'<div class="discovery-desc">' + desc + '</div>' if desc else ''}
-        </div>\n"""
+    # Derive graph_id from graph_file if not provided
+    if not graph_id:
+        graph_id = Path(graph_file).stem
 
     seeds_html = ""
     for seed in sorted(graph.seeds):
         node = graph.nodes.get(seed, {})
-        title = node.get("title") or seed
+        title = html_module.escape(node.get("title") or seed)
         seeds_html += f'<li><a href="{seed}" target="_blank">{title}</a></li>\n'
 
     domains = graph.domains()
     domains_html = ""
     for domain, count in list(domains.items())[:30]:
-        domains_html += f'<span class="domain-tag">{domain} ({count})</span>\n'
+        domains_html += f'<span class="domain-tag">{html_module.escape(domain)} ({count})</span>\n'
 
     return Template(SERVE_HTML).safe_substitute(
-        name=graph.metadata.get("name", "unnamed"),
-        description=graph.metadata.get("description", ""),
+        name=html_module.escape(graph.metadata.get("name", "unnamed")),
+        description=html_module.escape(graph.metadata.get("description", "")),
         n_nodes=stats["nodes"],
         n_edges=stats["edges"],
         n_seeds=stats["seeds"],
         n_domains=stats["domains"],
-        discoveries_html=discoveries_html or '<div style="color:#555">no discoveries yet - try crawling with more hops</div>',
         seeds_html=seeds_html,
         domains_html=domains_html,
+        graph_id=graph_id,
         graph_file=graph_file,
     )
 

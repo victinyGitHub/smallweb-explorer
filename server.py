@@ -79,7 +79,7 @@ async def handle_graph_html(request):
     if not path.exists():
         return web.json_response({"error": "graph not found"}, status=404)
     graph = WebGraph.load(str(path))
-    html = render_html(graph, f"{graph_id}.json")
+    html = render_html(graph, f"{graph_id}.json", graph_id=graph_id)
     return web.Response(text=html, content_type="text/html")
 
 
@@ -291,8 +291,9 @@ async def handle_discoveries(request):
     top = int(request.query.get("top", 30))
     damping = float(request.query.get("damping", 0.95))
     iterations = int(request.query.get("iterations", 50))
+    personalized = request.query.get("personalized", "true").lower() != "false"
     graph = WebGraph.load(str(path))
-    discoveries = graph.discoveries(top_n=top, damping=damping, iterations=iterations)
+    discoveries = graph.discoveries(top_n=top, damping=damping, iterations=iterations, personalized=personalized)
 
     results = []
     for url, score, node in discoveries:
