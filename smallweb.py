@@ -669,77 +669,151 @@ def extract_links_and_meta(html: str, base_url: str) -> Tuple[str, str, List[str
 
 def quality_score(html: str, soup: BeautifulSoup) -> float:
     """
-    Compute a simple quality score for a page (0.0 to 1.0).
+    Compute a quality score for a page (0.0 to 1.0).
 
-    Signals (from Marginalia's approach):
-    - Script tag count: many scripts = commercial/heavy
-    - Text-to-HTML ratio: low ratio = boilerplate-heavy
-    - Link density: high ratio of links to text = link farm
-    - Tracker detection: known tracking domains in script srcs
+    Ported from Marginalia's DocumentValuator + FeatureExtractor approach.
+    Uses an additive penalty/bonus system on a log text-to-html ratio base.
+
+    Penalties: tracking scripts, ad-tech, affiliate links, cookie consent,
+              excessive scripts, low text ratio, link farms, AI content signals.
+    Bonuses:  IndieWeb signals (webmention, indieauth, RSS), clean HTML.
 
     Returns a float between 0.0 (spam) and 1.0 (clean content).
     """
     text = soup.get_text()
     text_len = len(text)
     html_len = max(len(html), 1)
+    html_lower = html.lower()
 
-    # Script count
+    # ── Base score: text-to-html ratio (Marginalia's core signal) ──
+    # log(text/html) normalized to 0-1 range. Clean pages have ratio ~0.3-0.6,
+    # framework-heavy pages ~0.01-0.05
+    import math
+    text_ratio = text_len / html_len
+    base = (math.log(text_ratio + 0.001) + 5) / 7  # maps ~0.001->0.1, ~0.5->0.95
+    base = max(0.1, min(1.0, base))
+
+    # ── Penalty system (additive, then applied as multiplier) ──
+    penalty = 0.0
+
+    # --- Script analysis ---
     scripts = soup.find_all("script")
-    script_count = len(scripts)
+    inline_scripts = 0
+    external_scripts = 0
+    dynamic_injection = 0
 
-    # External script domains (tracker signal)
-    tracker_domains = {
-        "google-analytics.com", "googletagmanager.com", "facebook.net",
-        "doubleclick.net", "hotjar.com", "segment.com", "mixpanel.com",
-        "amplitude.com", "optimizely.com", "crazyegg.com", "hubspot.com",
+    # Tracker/ad-tech domains (from Marginalia's FeatureExtractor)
+    TRACKER_DOMAINS = {
+        "google-analytics.com", "googletagmanager.com", "googlesyndication.com",
+        "googleadservices.com", "google.com/adsense",
+        "facebook.net", "facebook.com/tr", "connect.facebook.net",
+        "doubleclick.net", "amazon-adsystem.com", "adnxs.com",
+        "hotjar.com", "segment.com", "mixpanel.com", "amplitude.com",
+        "optimizely.com", "crazyegg.com", "hubspot.com", "pardot.com",
+        "marketo.net", "newrelic.com", "nr-data.net",
+        "quantserve.com", "scorecardresearch.com", "chartbeat.com",
+        "omtrdc.net", "demdex.net",  # Adobe analytics
+        "adsrvr.org", "criteo.com", "taboola.com", "outbrain.com",
+        "sharethrough.com", "pubmatic.com", "rubiconproject.com",
+        "openx.net", "bidswitch.net",
     }
-    external_trackers = 0
+
+    tracker_count = 0
+    adtech_count = 0
+
     for s in scripts:
         src = s.get("src", "")
         if src:
-            src_domain = urlparse(src).netloc.lower()
-            for tracker in tracker_domains:
-                if tracker in src_domain:
-                    external_trackers += 1
+            external_scripts += 1
+            src_lower = src.lower()
+            for tracker in TRACKER_DOMAINS:
+                if tracker in src_lower:
+                    if any(ad in tracker for ad in ["adsystem", "adsrvr", "adnxs",
+                            "doubleclick", "syndication", "criteo", "taboola",
+                            "outbrain", "pubmatic", "rubicon", "openx", "bidswitch"]):
+                        adtech_count += 1
+                    else:
+                        tracker_count += 1
                     break
+        else:
+            inline_scripts += 1
+            # Check for dynamic script injection (Marginalia's createElement signal)
+            script_text = s.string or ""
+            if "createElement(" in script_text or "createElement (" in script_text:
+                dynamic_injection += 1
 
-    # Text density
-    text_ratio = text_len / html_len
+    # Script penalties (inspired by Marginalia's ScriptVisitor)
+    penalty += external_scripts * 0.08     # -0.08 per external script
+    penalty += inline_scripts * 0.02       # -0.02 per inline script
+    penalty += dynamic_injection * 0.1     # -0.1 per createElement
+    penalty += tracker_count * 0.15        # -0.15 per tracker (Marginalia: -2.5 on their scale)
+    penalty += adtech_count * 0.2          # -0.2 per ad-tech script (Marginalia: -2.5)
 
-    # Link density (outlinks per word)
-    outlinks = len(soup.find_all("a", href=True))
+    # --- Cookie consent / GDPR banners ---
+    CONSENT_SIGNALS = [
+        "cookielaw", "onetrust", "cookieconsent", "cookie-consent",
+        "gdpr", "cookie-banner", "cookiebanner", "didomi",
+        "quantcast.mgr", "sp_data", "consent-manager",
+    ]
+    consent_found = sum(1 for sig in CONSENT_SIGNALS if sig in html_lower)
+    penalty += min(consent_found * 0.1, 0.3)  # cap at -0.3
+
+    # --- Affiliate links ---
+    affiliate_patterns = ["amzn.to/", "tag=", "affiliate", "ref=", "partner="]
+    all_links = soup.find_all("a", href=True)
+    affiliate_count = sum(1 for a in all_links
+                         if any(p in (a.get("href", "").lower()) for p in affiliate_patterns))
+    penalty += min(affiliate_count * 0.05, 0.25)
+
+    # --- AI content farm signals (from Marginalia's ChatGPT detection) ---
+    headings = soup.find_all(["h1", "h2", "h3", "h4"])
+    heading_texts = [h.get_text().lower().strip() for h in headings]
+    ai_signals = 0
+    AI_HEADING_PATTERNS = [
+        "benefits of", "key benefits", "key takeaways", "in conclusion",
+        "frequently asked questions", "what you need to know",
+        "everything you need to know", "ultimate guide",
+        "step-by-step guide", "pros and cons",
+    ]
+    for ht in heading_texts:
+        for pattern in AI_HEADING_PATTERNS:
+            if pattern in ht:
+                ai_signals += 1
+                break
+    if ai_signals >= 3:
+        penalty += 0.5   # almost certainly AI content farm
+    elif ai_signals >= 1:
+        penalty += 0.15
+
+    # --- Link density (link farm detection) ---
     text_words = max(len(text.split()), 1)
-    link_density = outlinks / text_words
-
-    # Scoring
-    score = 1.0
-
-    # Penalize script-heavy pages
-    if script_count > 15:
-        score *= 0.3
-    elif script_count > 10:
-        score *= 0.5
-    elif script_count > 5:
-        score *= 0.8
-
-    # Penalize tracker-laden pages
-    if external_trackers >= 3:
-        score *= 0.4
-    elif external_trackers >= 1:
-        score *= 0.7
-
-    # Penalize boilerplate-heavy pages
-    if text_ratio < 0.05:
-        score *= 0.4
-    elif text_ratio < 0.1:
-        score *= 0.6
-
-    # Penalize link farms
+    link_density = len(all_links) / text_words
     if link_density > 0.5:
-        score *= 0.3
+        penalty += 0.4
     elif link_density > 0.3:
-        score *= 0.6
+        penalty += 0.2
 
+    # --- Acceptable Ads / ad-block detection (Marginalia: instant reject) ---
+    if "data-adblockkey" in html_lower or "x-adblock-key" in html_lower:
+        penalty += 0.6  # "only domain squatters" use this per Marginalia
+
+    # ── Bonus system (positive signals) ──
+    bonus = 0.0
+
+    # IndieWeb signals (from Marginalia's FeatureExtractor)
+    if 'rel="webmention"' in html_lower or "webmention" in html_lower:
+        bonus += 0.1
+    if 'rel="indieauth"' in html_lower or "indieauth" in html_lower:
+        bonus += 0.1
+    # RSS/Atom feed link
+    if 'type="application/rss+xml"' in html_lower or 'type="application/atom+xml"' in html_lower:
+        bonus += 0.05
+    # Microformats (h-card, h-entry — IndieWeb building blocks)
+    if "h-card" in html_lower or "h-entry" in html_lower:
+        bonus += 0.05
+
+    # ── Final score ──
+    score = base - penalty + bonus
     return round(max(0.0, min(1.0, score)), 3)
 
 
@@ -834,6 +908,39 @@ def is_platform_domain(domain: str) -> bool:
     return False
 
 
+import re
+
+# URL spam patterns — from Marginalia's UrlBlocklist + our own additions.
+# These catch link farms, download bait, git repos, and auto-generated content.
+_URL_SPAM_PATTERNS = [
+    re.compile(r'\.git/'),                          # Git repository paths
+    re.compile(r'wp-content/upload'),               # WordPress upload dirs
+    re.compile(r'-download-free'),                  # Download bait
+    re.compile(r'/download/.+/download'),           # Download farm loops
+    re.compile(r'/permalink/'),                     # Permalink farms
+    re.compile(r'[0-9a-f]{32,}'),                   # Long hex strings (git hashes, session IDs)
+    re.compile(r'/tag/|/tags/|/category/|/categories/'),  # Taxonomy pages (low content)
+    re.compile(r'/page/\d+/?$'),                    # Paginated listing pages
+    re.compile(r'/feed/?$|/rss/?$|/atom\.xml'),     # Feed URLs (not content)
+    re.compile(r'\.(pdf|zip|tar|gz|exe|dmg|pkg|deb|rpm|msi|iso)$', re.I),  # Binary files
+    re.compile(r'\.(png|jpg|jpeg|gif|svg|webp|ico|mp3|mp4|wav|avi|mov)$', re.I),  # Media files
+    re.compile(r'/wp-json/'),                       # WordPress API endpoints
+    re.compile(r'/xmlrpc\.php'),                    # WordPress XML-RPC
+    re.compile(r'/api/|/graphql'),                  # API endpoints
+    re.compile(r'/(login|signin|signup|register|auth|oauth)/?', re.I),  # Auth pages
+    re.compile(r'/search\?|/search/\?'),            # Search result pages
+    re.compile(r'[?&](utm_|fbclid|gclid|ref=)'),   # Tracking parameters
+]
+
+
+def is_spam_url(url: str) -> bool:
+    """Check if a URL matches known spam/low-value patterns."""
+    for pattern in _URL_SPAM_PATTERNS:
+        if pattern.search(url):
+            return True
+    return False
+
+
 def _get_domain(url: str) -> str:
     """Extract domain from URL."""
     return urlparse(url).netloc.lower()
@@ -893,6 +1000,8 @@ async def crawl(seeds: List[str], max_hops: int = 2, max_pages: int = 200,
     queue: List[Tuple[str, int]] = [(url, 0) for url in graph.seeds]  # (url, depth)
     visited: Set[str] = set()
     domain_counts: Dict[str, int] = defaultdict(int)  # domain -> pages crawled from it
+    domain_outlink_diversity: Dict[str, Set[str]] = defaultdict(set)  # domain -> set of domains it links to
+    seed_domains = {_get_domain(url) for url in graph.seeds}
     pages_crawled = 0
 
     connector = aiohttp.TCPConnector(limit=concurrent, ssl=False)
@@ -922,10 +1031,23 @@ async def crawl(seeds: List[str], max_hops: int = 2, max_pages: int = 200,
                     skip_indices.append(i)
                     continue
 
-                # Skip if this domain has hit its cap
-                if domain_cap > 0 and domain_counts[domain] >= domain_cap:
-                    skip_indices.append(i)
-                    continue
+                # Adaptive per-domain budget (inspired by Marginalia)
+                # Seed domains get 2.5x the base cap (user explicitly chose them).
+                # Domains that link to many diverse sites get a bonus (they're hubs).
+                # Other domains use the base cap.
+                if domain_cap > 0:
+                    if domain in seed_domains:
+                        effective_cap = int(domain_cap * 2.5)
+                    else:
+                        # Bonus for domains that link to diverse sites in our graph
+                        diversity = len(domain_outlink_diversity.get(domain, set()))
+                        if diversity >= 5:
+                            effective_cap = int(domain_cap * 1.5)
+                        else:
+                            effective_cap = domain_cap
+                    if domain_counts[domain] >= effective_cap:
+                        skip_indices.append(i)
+                        continue
 
                 visited.add(normalized)
                 skip_indices.append(i)
@@ -964,6 +1086,10 @@ async def crawl(seeds: List[str], max_hops: int = 2, max_pages: int = 200,
                 for link in links:
                     graph.add_edge(final_url, link)
                     link_norm = graph._normalize_url(link)
+                    # Track outlink diversity for adaptive budgets
+                    link_domain = _get_domain(link)
+                    if link_domain != domain:
+                        domain_outlink_diversity[domain].add(link_domain)
 
                     # Store anchor texts on the target node
                     if link in anchors:
@@ -983,12 +1109,22 @@ async def crawl(seeds: List[str], max_hops: int = 2, max_pages: int = 200,
                         link_domain = _get_domain(link)
                         if is_platform_domain(link_domain):
                             continue
+                        # Skip spam/low-value URL patterns
+                        if is_spam_url(link):
+                            continue
                         if link_norm not in graph.nodes:
                             graph.add_node(link, depth=depth + 1)
                         queue.append((link, depth + 1))
 
                 # Show progress with domain count
-                cap_info = f" [{domain}: {domain_counts[domain]}/{domain_cap}]" if domain_cap > 0 else ""
+                if domain_cap > 0:
+                    eff_cap = int(domain_cap * 2.5) if domain in seed_domains else (
+                        int(domain_cap * 1.5) if len(domain_outlink_diversity.get(domain, set())) >= 5
+                        else domain_cap)
+                    seed_tag = "★" if domain in seed_domains else ""
+                    cap_info = f" [{domain}: {domain_counts[domain]}/{eff_cap}{seed_tag}]"
+                else:
+                    cap_info = ""
                 status = f"[{pages_crawled}/{max_pages}] depth={depth}{cap_info} {title[:40] or final_url[:40]}"
                 print(f"  {status}", flush=True)
 
