@@ -160,27 +160,34 @@ class WebGraph:
         Return top-ranked pages that are NOT seeds.
         These are the things you discovered by crawling outward.
 
-        When use_quality=True, the final score is pagerank * quality_score.
-        This demotes spammy/script-heavy pages even if they have good link authority.
+        The final score combines multiple signals:
+        - PageRank (link authority, optionally personalized toward seeds)
+        - Quality (HTML cleanliness: scripts, trackers, text ratio)
+        - Smallweb score (data-driven: popularity bell curve × outlink profile)
+
+        This means: a page needs good link authority AND clean HTML AND
+        moderate popularity AND links to other small sites to rank highly.
 
         Args:
             top_n:        Number of discoveries to return
             damping:      PageRank damping factor (0.95 = follow links deep,
                           0.5 = stay close to seeds)
             iterations:   PageRank iterations (50 is usually plenty)
-            use_quality:  Multiply by quality score to penalize spam
+            use_quality:  Multiply by quality + smallweb scores
             personalized: Use personalized pagerank (biased toward seeds)
         """
         ranks = self.pagerank(damping=damping, iterations=iterations, personalized=personalized)
 
         # Build set of seed domains to filter out same-domain pages
-        # e.g. if seed is gutenberg.org/files/59/..., filter out gutenberg.org/
         seed_domains = set()
         for seed in self.seeds:
             try:
                 seed_domains.add(urlparse(seed).netloc.lower())
             except Exception:
                 pass
+
+        # Compute data-driven smallweb scores per domain
+        sw_scores = self._smallweb_scores() if use_quality else {}
 
         results = []
         for url, score in ranks.items():
@@ -193,16 +200,23 @@ class WebGraph:
                 # Skip pages on the same domain as any seed (internal navigation)
                 if domain in seed_domains:
                     continue
-                # Skip major platform domains (not small web)
-                if is_platform_domain(domain):
-                    continue
             except Exception:
-                pass
+                domain = ""
+
             if use_quality:
                 q = self.nodes[url].get("quality", 1.0)
-                final_score = score * q
+                sw = sw_scores.get(domain, {}).get("smallweb_score", 0.5)
+                final_score = score * q * sw
+
+                # Store smallweb metadata on the node for API/frontend access
+                sw_data = sw_scores.get(domain, {})
+                self.nodes[url]["smallweb_score"] = sw
+                self.nodes[url]["inbound_domains"] = sw_data.get("inbound_domains", 0)
+                self.nodes[url]["outlink_score"] = sw_data.get("outlink_score", 0.5)
+                self.nodes[url]["popularity_score"] = sw_data.get("popularity_score", 0.5)
             else:
                 final_score = score
+
             results.append((url, final_score, self.nodes[url]))
         # Re-sort by final score after quality weighting
         results.sort(key=lambda x: x[1], reverse=True)
@@ -221,6 +235,114 @@ class WebGraph:
                 if from_domain != to_domain:  # external links only
                     inbound[to_domain].add(from_domain)
         return inbound
+
+    def _outlink_profile(self, domain: str, graph_domains: Set[str] = None) -> float:
+        """
+        Compute an "outlink profile" score for a domain (0.0 to 1.0).
+
+        Uses two signals:
+        1. What fraction of outlinks point to domains IN our graph (ecosystem links)
+        2. What fraction of outlinks point to known platforms (platform links)
+
+        A site that links to other sites we've discovered is more "part of our web."
+        A site that links entirely outside our graph is likely a platform or unrelated.
+
+        Returns 1.0 for sites deeply integrated in our graph's ecosystem.
+        Returns 0.0 for sites that only link to platforms/outside our graph.
+        Returns 0.5 (neutral) if no outlink data is available.
+        """
+        # Aggregate all outlinks from all pages on this domain
+        external_targets = []
+        for url, targets in self.edges.items():
+            if urlparse(url).netloc.lower() == domain:
+                for target in targets:
+                    td = urlparse(target).netloc.lower()
+                    if td != domain:  # external only
+                        external_targets.append(td)
+
+        if not external_targets:
+            return 0.5  # no data = neutral
+
+        total = len(external_targets)
+
+        # Signal 1: ecosystem integration - links to domains in our graph
+        if graph_domains:
+            in_graph = sum(1 for td in external_targets if td in graph_domains)
+            ecosystem_fraction = in_graph / total
+        else:
+            ecosystem_fraction = 0.5
+
+        # Signal 2: platform avoidance - links NOT to known platforms
+        platform_count = sum(1 for td in external_targets if is_platform_domain(td))
+        non_platform_fraction = 1.0 - (platform_count / total)
+
+        # Combined: ecosystem is the stronger signal (0.7), platform avoidance weaker (0.3)
+        score = 0.7 * ecosystem_fraction + 0.3 * non_platform_fraction
+
+        return round(score, 3)
+
+    def _smallweb_scores(self) -> Dict[str, dict]:
+        """
+        Compute per-domain "smallweb-ness" scores using data-driven signals.
+
+        Returns dict of domain -> {
+            inbound_domains: int,   # how many domains link to this one
+            popularity_score: float, # bell curve peaking at moderate popularity
+            outlink_score: float,    # how much it links into our ecosystem
+            smallweb_score: float,   # combined score 0.0-1.0
+        }
+        """
+        inbound = self._build_inbound_index()
+
+        # Build set of all domains in graph for ecosystem scoring
+        scores = {}
+        all_domains = set()
+        for url in self.nodes:
+            all_domains.add(urlparse(url).netloc.lower())
+
+        if not all_domains:
+            return {}
+
+        for domain in all_domains:
+            n_inbound = len(inbound.get(domain, set()))
+            outlink = self._outlink_profile(domain, graph_domains=all_domains)
+
+            # Popularity curve: log-normal-ish bell curve
+            # Peaks at ~4 inbound domains, drops off on both sides
+            if n_inbound == 0:
+                pop_score = 0.4  # orphan pages are suspect
+            elif n_inbound <= 2:
+                pop_score = 0.7  # few links, possibly real
+            elif n_inbound <= 8:
+                pop_score = 1.0  # sweet spot
+            elif n_inbound <= 15:
+                pop_score = 0.6  # getting popular
+            elif n_inbound <= 30:
+                pop_score = 0.3  # quite popular, probably not small web
+            elif n_inbound <= 60:
+                pop_score = 0.15  # very popular
+            else:
+                pop_score = 0.05  # platform-level
+
+            # Combined: popularity × outlink profile
+            # Both signals matter: a site should be moderately popular
+            # AND link to other small sites in our ecosystem
+            combined = pop_score * (0.5 + 0.5 * outlink)  # outlink moderates, doesn't dominate
+
+            # Safety net: if domain is a known platform, cap the score
+            # This isn't the primary filter (data-driven signals are), but prevents
+            # edge cases where a platform has just 3 inbound links in a small graph
+            if is_platform_domain(domain):
+                combined = min(combined, 0.15)
+
+            scores[domain] = {
+                "inbound_domains": n_inbound,
+                "popularity_score": round(pop_score, 3),
+                "outlink_score": round(outlink, 3),
+                "smallweb_score": round(combined, 3),
+            }
+
+        return scores
 
     def similar_sites(self, target: str, top_n: int = 20) -> List[Tuple[str, float, int]]:
         """
@@ -609,7 +731,7 @@ PLATFORM_DOMAINS = {
     # Social media & messaging
     "twitter.com", "x.com", "facebook.com", "instagram.com", "tiktok.com",
     "linkedin.com", "pinterest.com", "snapchat.com", "threads.net",
-    "discord.gg", "discord.com", "t.me", "telegram.org",
+    "discord.gg", "discord.com", "t.me", "telegram.org", "t.co",
     "mastodon.social", "joinmastodon.org",
     # Code hosting (the platform, not user content)
     "github.com", "gitlab.com", "codeberg.org", "bitbucket.org",
@@ -911,6 +1033,12 @@ SERVE_HTML = """<!DOCTYPE html>
   /* Score badge */
   .score-badge { font-size: 0.65rem; color: #333; font-weight: 600; white-space: nowrap; }
 
+  /* Smallweb score indicator */
+  .sw-indicator { display: flex; align-items: center; gap: 0.3rem; margin-top: 0.25rem; }
+  .sw-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+  .sw-label { font-size: 0.6rem; color: #555; }
+  .sw-details { font-size: 0.58rem; color: #3a3a3a; margin-top: 0.1rem; }
+
   /* Similar button */
   .btn-similar { background: none; border: 1px solid #222; color: #666; font-size: 0.68rem; padding: 0.2rem 0.5rem; border-radius: 4px; cursor: pointer; font-family: inherit; transition: all 0.2s; margin-top: 0.4rem; }
   .btn-similar:hover { border-color: #4fc3f7; color: #4fc3f7; }
@@ -1004,6 +1132,7 @@ SERVE_HTML = """<!DOCTYPE html>
         <div class="toggle-group">
           <button class="toggle-btn active" data-sort="score" onclick="switchSort('score')">pagerank</button>
           <button class="toggle-btn" data-sort="quality" onclick="switchSort('quality')">quality</button>
+          <button class="toggle-btn" data-sort="smallweb" onclick="switchSort('smallweb')">smallweb</button>
           <button class="toggle-btn" data-sort="blended" onclick="switchSort('blended')">blended</button>
         </div>
       </div>
@@ -1105,10 +1234,12 @@ function renderDiscoveries(discoveries) {
   let sorted = [...discoveries];
   if (currentSort === 'quality') {
     sorted.sort((a, b) => (b.quality || 0) - (a.quality || 0));
+  } else if (currentSort === 'smallweb') {
+    sorted.sort((a, b) => (b.smallweb_score || 0) - (a.smallweb_score || 0));
   } else if (currentSort === 'blended') {
-    sorted.sort((a, b) => ((b.score || 0) * (b.quality || 1)) - ((a.score || 0) * (a.quality || 1)));
+    sorted.sort((a, b) => ((b.score || 0) * (b.quality || 1) * (b.smallweb_score || 0.5)) - ((a.score || 0) * (a.quality || 1) * (a.smallweb_score || 0.5)));
   }
-  // 'score' is already default order from API
+  // 'score' is already default order from API (pagerank * quality * smallweb)
 
   if (sorted.length === 0) {
     container.innerHTML = '<div class="empty">no discoveries yet &mdash; try crawling with more hops</div>';
@@ -1121,6 +1252,10 @@ function renderDiscoveries(discoveries) {
     const qColor = quality >= 0.7 ? '#81c784' : quality >= 0.4 ? '#ffb74d' : '#ef5350';
     const qPct = Math.round(quality * 100);
     const domain = d.domain || new URL(d.url).hostname;
+    const sw = d.smallweb_score != null ? d.smallweb_score : 0.5;
+    const swColor = sw >= 0.7 ? '#81c784' : sw >= 0.4 ? '#ffb74d' : sw >= 0.15 ? '#ef5350' : '#666';
+    const inbound = d.inbound_domains || 0;
+    const outlink = d.outlink_score != null ? Math.round(d.outlink_score * 100) : '?';
 
     // Anchor text pills (max 5)
     const anchors = (d.anchor_texts || []).slice(0, 5);
@@ -1142,6 +1277,11 @@ function renderDiscoveries(discoveries) {
             '<div class="quality-bar"><div class="quality-bar-fill" style="width:' + qPct + '%;background:' + qColor + '"></div></div>' +
             '<span class="quality-label" style="color:' + qColor + '">' + qPct + '</span>' +
           '</div>' +
+          '<div class="sw-indicator" title="smallweb score: ' + sw.toFixed(2) + ' | inbound: ' + inbound + ' domains | outlinks: ' + outlink + '% small">' +
+            '<span class="sw-dot" style="background:' + swColor + '"></span>' +
+            '<span class="sw-label" style="color:' + swColor + '">sw ' + sw.toFixed(2) + '</span>' +
+          '</div>' +
+          '<div class="sw-details">' + inbound + ' in · ' + outlink + '% small</div>' +
           '<div class="score-badge">#' + (i + 1) + ' &middot; ' + d.score.toFixed(4) + '</div>' +
         '</div>' +
       '</div>' +

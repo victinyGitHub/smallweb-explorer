@@ -305,6 +305,10 @@ async def handle_discoveries(request):
             "domain": node.get("domain", ""),
             "quality": node.get("quality", 1.0),
             "anchor_texts": node.get("anchor_texts", []),
+            "smallweb_score": node.get("smallweb_score", 0.5),
+            "inbound_domains": node.get("inbound_domains", 0),
+            "outlink_score": node.get("outlink_score", 0.5),
+            "popularity_score": node.get("popularity_score", 0.5),
         })
 
     return web.json_response({"discoveries": results, "total": len(results)})
