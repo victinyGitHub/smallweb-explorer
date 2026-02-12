@@ -687,6 +687,194 @@ async def handle_taste_batch(request):
     return web.json_response(result)
 
 
+async def handle_domain_graph(request):
+    """Return a domain-level aggregated graph for visualization."""
+    from urllib.parse import urlparse
+    from collections import defaultdict
+
+    graph_id = request.match_info["id"]
+    path = GRAPHS_DIR / f"{graph_id}.json"
+    if not path.exists():
+        return web.json_response({"error": "graph not found"}, status=404)
+
+    top = int(request.query.get("top", 80))
+    graph = _get_graph(graph_id)
+
+    # Aggregate nodes by domain
+    domain_data = defaultdict(lambda: {
+        "pages": 0, "pagerank": 0, "quality_sum": 0, "quality_count": 0,
+        "smallweb": 0, "is_seed": False, "top_title": ""
+    })
+
+    seed_domains = set()
+    for seed in graph.seeds:
+        try:
+            sd = urlparse(seed).netloc.lower()
+            seed_domains.add(sd)
+        except:
+            pass
+
+    for url, node in graph.nodes.items():
+        domain = node.get("domain") or urlparse(url).netloc.lower()
+        dd = domain_data[domain]
+        dd["pages"] += 1
+        pr = node.get("pagerank", node.get("pagerank_pct", 0))
+        if pr > dd["pagerank"]:
+            dd["pagerank"] = pr
+            dd["top_title"] = node.get("title", "")
+        if "quality" in node:
+            dd["quality_sum"] += node["quality"]
+            dd["quality_count"] += 1
+        dd["smallweb"] = max(dd["smallweb"], node.get("smallweb_score", 0))
+        if domain in seed_domains:
+            dd["is_seed"] = True
+
+    # Build domain nodes
+    domain_nodes = []
+    for domain, dd in domain_data.items():
+        avg_quality = dd["quality_sum"] / dd["quality_count"] if dd["quality_count"] > 0 else 0.5
+        domain_nodes.append({
+            "id": domain,
+            "pages": dd["pages"],
+            "pagerank": dd["pagerank"],
+            "quality": round(avg_quality, 3),
+            "smallweb": round(dd["smallweb"], 3),
+            "is_seed": dd["is_seed"],
+            "top_title": dd["top_title"][:60] if dd["top_title"] else ""
+        })
+
+    # Sort by pagerank, take top N
+    domain_nodes.sort(key=lambda n: n["pagerank"], reverse=True)
+    # Always include seeds
+    seed_nodes = [n for n in domain_nodes if n["is_seed"]]
+    non_seed = [n for n in domain_nodes if not n["is_seed"]]
+    remaining = max(0, top - len(seed_nodes))
+    domain_nodes = seed_nodes + non_seed[:remaining]
+    visible_domains = set(n["id"] for n in domain_nodes)
+
+    # Aggregate edges by domain pair
+    domain_links = defaultdict(int)
+    for from_url, to_urls in graph.edges.items():
+        from_domain = urlparse(from_url).netloc.lower()
+        if from_domain not in visible_domains:
+            continue
+        for to_url in to_urls:
+            to_domain = urlparse(to_url).netloc.lower()
+            if to_domain != from_domain and to_domain in visible_domains:
+                key = (from_domain, to_domain)
+                domain_links[key] += 1
+
+    links = [{"source": s, "target": t, "weight": w} for (s, t), w in domain_links.items()]
+
+    return web.json_response({"nodes": domain_nodes, "links": links})
+
+
+async def handle_audit(request):
+    """Trace the discovery chain from seeds to a target URL."""
+    from urllib.parse import urlparse
+    from collections import defaultdict, deque
+
+    graph_id = request.match_info["id"]
+    target_url = request.query.get("url", "")
+    if not target_url:
+        return web.json_response({"error": "url parameter required"}, status=400)
+
+    path = GRAPHS_DIR / f"{graph_id}.json"
+    if not path.exists():
+        return web.json_response({"error": "graph not found"}, status=404)
+
+    graph = _get_graph(graph_id)
+
+    # Build URL-level reverse edges
+    reverse = defaultdict(set)
+    for from_url, to_urls in graph.edges.items():
+        for to_url in to_urls:
+            reverse[to_url].add(from_url)
+
+    # BFS backwards from target to any seed
+    seed_set = set(graph.seeds)
+    parent = {target_url: None}
+    queue = deque([target_url])
+    found_seed = None
+
+    while queue and found_seed is None:
+        current = queue.popleft()
+        if current in seed_set:
+            found_seed = current
+            break
+        for prev_url in reverse.get(current, []):
+            if prev_url not in parent:
+                parent[prev_url] = current
+                queue.append(prev_url)
+                if prev_url in seed_set:
+                    found_seed = prev_url
+                    break
+
+    # Reconstruct chain
+    chain = []
+    if found_seed is not None:
+        # Walk from seed to target
+        path_urls = []
+        current = found_seed
+        while current is not None:
+            path_urls.append(current)
+            current = parent.get(current)
+        for url in path_urls:
+            node = graph.nodes.get(url, {})
+            chain.append({
+                "url": url,
+                "title": node.get("title", ""),
+                "domain": node.get("domain", urlparse(url).netloc.lower()),
+                "is_seed": url in seed_set,
+                "depth": node.get("depth", -1)
+            })
+
+    # Count alternative paths (other seeds that can reach the target)
+    alt_paths = 0
+    if found_seed:
+        for seed in seed_set:
+            if seed != found_seed and seed in parent:
+                alt_paths += 1
+
+    # Direct inbound links to target with anchor texts
+    inbound_links = []
+    target_node = graph.nodes.get(target_url, {})
+    target_anchors = target_node.get("anchor_texts", [])
+    for from_url in reverse.get(target_url, set()):
+        from_node = graph.nodes.get(from_url, {})
+        from_domain = from_node.get("domain", urlparse(from_url).netloc.lower())
+        # Try to find matching anchor text
+        anchor = ""
+        for a in target_anchors:
+            if len(a) > 3:
+                anchor = a
+                break
+        inbound_links.append({
+            "url": from_url,
+            "domain": from_domain,
+            "title": from_node.get("title", ""),
+            "anchor_text": anchor
+        })
+    inbound_links = inbound_links[:20]
+
+    # Co-cited domains (share inbound sources)
+    target_domain = target_node.get("domain", urlparse(target_url).netloc.lower())
+    co_cited = []
+    try:
+        similar = graph.similar_sites(target_domain, top_n=5)
+        co_cited = [d for d, _, _ in similar if d != target_domain]
+    except:
+        pass
+
+    return web.json_response({
+        "target": target_url,
+        "chain": chain,
+        "alternative_paths": alt_paths,
+        "inbound_links": inbound_links,
+        "co_cited_with": co_cited
+    })
+
+
 async def warmup_embedding_model(app):
     """Pre-load the sentence-transformer model at startup so first request isn't slow."""
     import concurrent.futures
@@ -721,6 +909,8 @@ def create_app():
     app.router.add_post("/api/graphs/{id}/taste/train", handle_taste_train)
     app.router.add_get("/api/graphs/{id}/taste", handle_taste_status)
     app.router.add_post("/api/graphs/{id}/taste/batch", handle_taste_batch)
+    app.router.add_get("/api/graphs/{id}/domain-graph", handle_domain_graph)
+    app.router.add_get("/api/graphs/{id}/audit", handle_audit)
     app.router.add_post("/api/crawl", handle_start_crawl)
     app.router.add_get("/api/crawl/{id}", handle_crawl_status)
     app.router.add_get("/api/crawls", handle_list_crawls)

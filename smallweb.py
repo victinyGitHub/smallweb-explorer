@@ -1344,6 +1344,7 @@ SERVE_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <title>smallweb - $name</title>
+<script src="https://d3js.org/d3.v7.min.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: 'Berkeley Mono', 'IBM Plex Mono', monospace; background: #0a0a0a; color: #e0e0e0; padding: 2rem; max-width: 960px; margin: 0 auto; }
@@ -1463,6 +1464,45 @@ SERVE_HTML = """<!DOCTYPE html>
   .btn-train:hover { background: #81d4fa; }
   .btn-train:disabled { background: #333; color: #666; cursor: not-allowed; }
 
+  /* Why sentence */
+  .why-sentence { color: #888; font-size: 0.72rem; font-style: italic; margin: 0.3rem 0; line-height: 1.4; }
+
+  /* Stacked score bar */
+  .score-stack { display: flex; height: 8px; width: 120px; border-radius: 4px; overflow: hidden; margin-bottom: 4px; background: #111; }
+  .score-stack-seg { height: 100%; min-width: 2px; transition: width 0.3s; }
+  .score-stack-legend { display: flex; gap: 6px; font-size: 0.62rem; color: #666; flex-wrap: wrap; }
+  .score-stack-legend span { display: flex; align-items: center; gap: 2px; }
+  .score-stack-legend .dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+
+  /* Audit mode */
+  .btn-trace { background: none; border: 1px solid #222; color: #666; font-size: 0.68rem; padding: 0.2rem 0.5rem; border-radius: 4px; cursor: pointer; font-family: inherit; transition: all 0.2s; }
+  .btn-trace:hover { border-color: #ffa726; color: #ffa726; }
+  .audit-section { margin-top: 0.8rem; padding-top: 0.8rem; border-top: 1px solid #1a1a1a; }
+  .audit-chain { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; margin-bottom: 0.8rem; }
+  .audit-node { background: #111; border: 1px solid #333; border-radius: 4px; padding: 0.25rem 0.5rem; font-size: 0.72rem; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .audit-node a { color: inherit; text-decoration: none; }
+  .audit-node a:hover { text-decoration: underline; }
+  .audit-node.seed { border-color: #4fc3f7; color: #4fc3f7; }
+  .audit-node.target { border-color: #66bb6a; color: #66bb6a; }
+  .audit-arrow { color: #444; font-size: 0.8rem; }
+  .audit-label { font-size: 0.68rem; color: #555; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 0.3rem; }
+  .audit-inbound { margin-top: 0.6rem; }
+  .audit-inbound-item { font-size: 0.72rem; color: #888; margin: 0.2rem 0; }
+  .audit-inbound-item a { color: #888; }
+  .audit-anchor { color: #ffa726; font-style: italic; }
+  .audit-cocited { margin-top: 0.6rem; }
+  .audit-cocited-domain { color: #81c784; font-size: 0.72rem; cursor: pointer; }
+  .audit-cocited-domain:hover { text-decoration: underline; }
+  .audit-alt { font-size: 0.65rem; color: #555; margin-top: 0.3rem; }
+
+  /* Graph viz */
+  .graph-controls { margin-bottom: 0.8rem; display: flex; gap: 1rem; align-items: center; font-size: 0.8rem; flex-wrap: wrap; }
+  .graph-controls label { color: #888; display: flex; align-items: center; gap: 0.3rem; }
+  .graph-controls input[type="number"] { background: #111; color: #eee; border: 1px solid #333; padding: 2px 6px; border-radius: 4px; font-family: inherit; font-size: 0.8rem; width: 60px; }
+  .graph-controls input[type="checkbox"] { accent-color: #4fc3f7; }
+  #graphContainer { background: #050505; }
+  #graphTooltip { max-width: 260px; line-height: 1.4; font-family: inherit; }
+
   /* Similar button */
   .btn-similar { background: none; border: 1px solid #222; color: #666; font-size: 0.68rem; padding: 0.2rem 0.5rem; border-radius: 4px; cursor: pointer; font-family: inherit; transition: all 0.2s; margin-top: 0.4rem; }
   .btn-similar:hover { border-color: #4fc3f7; color: #4fc3f7; }
@@ -1564,6 +1604,7 @@ SERVE_HTML = """<!DOCTYPE html>
     <button class="tab active" data-tab="discoveries">discoveries</button>
     <button class="tab" data-tab="similarity">similarity</button>
     <button class="tab" data-tab="seeds">seeds & domains</button>
+    <button class="tab" data-tab="graph">graph</button>
   </div>
 
   <!-- Tab: Discoveries -->
@@ -1708,6 +1749,17 @@ SERVE_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Tab: Graph Visualization -->
+  <div class="tab-panel" id="tab-graph">
+    <div class="graph-controls">
+      <label>show top <input type="number" id="graphNodeLimit" value="80" min="10" max="500"> domains</label>
+      <label><input type="checkbox" id="graphShowLabels" checked> labels</label>
+      <button class="btn btn-sm" onclick="loadGraphViz()">reload</button>
+    </div>
+    <div id="graphContainer" style="width:100%;height:600px;border:1px solid #222;border-radius:8px;overflow:hidden;position:relative"></div>
+    <div id="graphTooltip" style="display:none;position:fixed;background:#111;border:1px solid #333;padding:8px 12px;border-radius:6px;font-size:0.72rem;pointer-events:none;z-index:1000;color:#ccc"></div>
+  </div>
+
   <footer>
     <a href="/smallweb/">smallweb</a> &mdash; graph: $graph_id
   </footer>
@@ -1732,6 +1784,10 @@ document.querySelectorAll('.tab').forEach(tab => {
     // Lazy-load similarity pairs
     if (tab.dataset.tab === 'similarity' && !document.getElementById('pairsContainer').dataset.loaded) {
       loadPairs();
+    }
+    // Lazy-load graph visualization
+    if (tab.dataset.tab === 'graph' && !graphLoaded) {
+      loadGraphViz();
     }
   });
 });
@@ -1863,36 +1919,351 @@ function renderDiscoveries(discoveries) {
       breakdownHtml += '<div class="breakdown-section"><div class="breakdown-title">quality</div><div class="breakdown-note">Not measured \u2014 this page was discovered as an outlink but not fetched. Quality defaults to 0.5 (neutral).</div></div>';
     }
 
+    var whyText = whySentence(d);
+    var auditId = 'audit-' + i;
+
     return '<div class="discovery">' +
       '<div class="discovery-header">' +
         '<div class="discovery-main">' +
           '<a class="discovery-title" href="' + d.url + '" target="_blank">' + escHtml(title) + '</a>' +
           '<div class="discovery-url">' + escHtml(d.url) + '</div>' +
           (d.description ? '<div class="discovery-desc">' + escHtml(d.description.slice(0, 150)) + '</div>' : '') +
+          (whyText ? '<div class="why-sentence">' + escHtml(whyText) + '</div>' : '') +
           anchorHtml +
           '<div class="taste-btns">' +
             '<button class="taste-btn' + (tasteLabels.positive.includes(d.url) ? ' positive' : '') + '" onclick="labelTaste(\\'' + escJs(d.url) + '\\', \\'positive\\', this)" title="good discovery">\u25B2</button>' +
             '<button class="taste-btn' + (tasteLabels.negative.includes(d.url) ? ' negative' : '') + '" onclick="labelTaste(\\'' + escJs(d.url) + '\\', \\'negative\\', this)" title="not useful">\u25BC</button>' +
             '<button class="btn-similar" onclick="findSimilarFrom(\\'' + escJs(domain) + '\\')">similar</button>' +
+            '<button class="btn-trace" onclick="loadAudit(\\'' + escJs(d.url) + '\\', \\'' + auditId + '\\')">trace</button>' +
           '</div>' +
         '</div>' +
         '<div style="text-align:right">' +
-          '<div class="quality-bar-wrap" title="quality: ' + (qMeasured ? qPct + '%' : 'not measured') + '">' +
-            '<div class="quality-bar"><div class="quality-bar-fill" style="width:' + qPct + '%;background:' + qColor + (qMeasured ? '' : ';opacity:0.3') + '"></div></div>' +
-            '<span class="quality-label" style="color:' + qColor + '">' + (qMeasured ? qPct : '?') + '</span>' +
-          '</div>' +
-          '<div class="sw-indicator" title="smallweb score: ' + sw.toFixed(2) + ' | inbound: ' + inbound + ' domains | outlinks: ' + outlink + '% small">' +
-            '<span class="sw-dot" style="background:' + swColor + '"></span>' +
-            '<span class="sw-label" style="color:' + swColor + '">sw ' + sw.toFixed(2) + '</span>' +
-          '</div>' +
-          '<div class="sw-details">' + inbound + ' in \u00b7 ' + outlink + '% small</div>' +
-          (taste !== 0.5 ? '<div class="taste-score">taste: ' + taste.toFixed(2) + '</div>' : '') +
+          scoreStackHtml(d) +
           '<div class="score-badge"><a class="why-toggle" onclick="toggleBreakdown(\\'' + breakdownId + '\\')" title="show score breakdown">#' + (i + 1) + ' \u00b7 ' + d.score.toFixed(4) + ' \u24d8</a></div>' +
         '</div>' +
       '</div>' +
       '<div class="breakdown" id="' + breakdownId + '" style="display:none">' + breakdownHtml + '</div>' +
+      '<div class="audit-section" id="' + auditId + '" style="display:none"></div>' +
     '</div>';
   }).join('');
+}
+
+// ── Why Sentence ──
+
+function whySentence(d) {
+  var parts = [];
+  var pr = d.pagerank_pct || 0;
+  var q = d.quality || 0.5;
+  var sw = d.smallweb_score || 0.5;
+  var taste = d.taste_score || 0.5;
+  var inbound = d.inbound_domains || 0;
+  var qMeasured = d.quality_measured !== false;
+
+  if (pr >= 0.8) parts.push('highly connected in your seed network');
+  else if (pr >= 0.5) parts.push('well-linked from sites you follow');
+
+  if (qMeasured && q >= 0.8) {
+    var bonuses = (d.quality_breakdown && d.quality_breakdown.bonuses || []).map(function(b) { return b.signal.replace(/_/g, ' '); });
+    parts.push(bonuses.length ? 'clean HTML with ' + bonuses.join(', ') : 'very clean HTML');
+  } else if (qMeasured && q >= 0.6) {
+    parts.push('decent quality markup');
+  } else if (qMeasured && q < 0.4) {
+    var penalties = d.quality_breakdown && d.quality_breakdown.penalties || [];
+    var topP = penalties[0];
+    if (topP) parts.push('lower quality (' + topP.signal.replace(/_/g, ' ') + ')');
+  }
+
+  if (sw >= 0.8) parts.push('sweet spot of ' + inbound + ' inbound domains');
+  else if (sw >= 0.5) parts.push('linked by ' + inbound + ' sites');
+
+  var anchors = d.anchor_texts || [];
+  if (anchors.length > 0 && anchors[0].length > 3 && anchors[0].length < 50) {
+    parts.push('described as \\u201c' + anchors[0] + '\\u201d');
+  }
+
+  if (taste > 0.7) parts.push('matches your taste');
+  else if (taste < 0.3) parts.push('outside your usual taste');
+
+  if (parts.length === 0) return '';
+  var s = parts.join(' \\u00b7 ');
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+// ── Stacked Score Bar ──
+
+function scoreStackHtml(d) {
+  var pr = d.pagerank_pct || 0.01;
+  var q = d.quality || 0.5;
+  var sw = d.smallweb_score || 0.5;
+  var taste = d.taste_score || 0.5;
+  var cfg = (currentConfig && currentConfig.formula) || {};
+  var prExp = cfg.pagerank_exp || 1.0;
+  var qExp = cfg.quality_exp || 1.0;
+  var swExp = cfg.smallweb_exp || 1.0;
+
+  var logPr = Math.abs(prExp * Math.log(Math.max(pr, 0.001)));
+  var logQ = Math.abs(qExp * Math.log(Math.max(q, 0.001)));
+  var logSw = Math.abs(swExp * Math.log(Math.max(sw, 0.001)));
+  var logT = Math.abs(Math.log(Math.max(0.5 + 0.5 * taste, 0.001)));
+  var total = logPr + logQ + logSw + logT || 1;
+
+  var pPr = Math.round(logPr / total * 100);
+  var pQ = Math.round(logQ / total * 100);
+  var pSw = Math.round(logSw / total * 100);
+  var pT = Math.max(0, 100 - pPr - pQ - pSw);
+
+  return '<div class="score-stack" title="score composition: pr ' + (logPr/total*100).toFixed(0) + '% / q ' + (logQ/total*100).toFixed(0) + '% / sw ' + (logSw/total*100).toFixed(0) + '%">' +
+    '<div class="score-stack-seg" style="width:' + pPr + '%;background:#4fc3f7"></div>' +
+    '<div class="score-stack-seg" style="width:' + pQ + '%;background:#66bb6a"></div>' +
+    '<div class="score-stack-seg" style="width:' + pSw + '%;background:#ffa726"></div>' +
+    (pT > 1 ? '<div class="score-stack-seg" style="width:' + pT + '%;background:#ab47bc"></div>' : '') +
+  '</div>' +
+  '<div class="score-stack-legend">' +
+    '<span><span class="dot" style="background:#4fc3f7"></span>pr ' + pr.toFixed(2) + '</span>' +
+    '<span><span class="dot" style="background:#66bb6a"></span>q ' + q.toFixed(2) + '</span>' +
+    '<span><span class="dot" style="background:#ffa726"></span>sw ' + sw.toFixed(2) + '</span>' +
+    (taste !== 0.5 ? '<span><span class="dot" style="background:#ab47bc"></span>t ' + taste.toFixed(2) + '</span>' : '') +
+  '</div>';
+}
+
+// ── Audit Mode ──
+
+async function loadAudit(url, auditId) {
+  var el = document.getElementById(auditId);
+  if (!el) return;
+
+  // Toggle
+  if (el.style.display !== 'none' && el.innerHTML) {
+    el.style.display = 'none';
+    return;
+  }
+
+  el.style.display = 'block';
+  el.innerHTML = '<div class="loading"><span class="spinner"></span>tracing discovery chain...</div>';
+
+  try {
+    var res = await fetch(API + '/graphs/' + GRAPH_ID + '/audit?url=' + encodeURIComponent(url));
+    var data = await res.json();
+
+    if (data.error) {
+      el.innerHTML = '<div class="empty">' + escHtml(data.error) + '</div>';
+      return;
+    }
+
+    var html = '';
+
+    // Chain visualization
+    if (data.chain && data.chain.length > 0) {
+      html += '<div class="audit-label">discovery path</div>';
+      html += '<div class="audit-chain">';
+      data.chain.forEach(function(node, idx) {
+        var cls = node.is_seed ? 'audit-node seed' : (idx === data.chain.length - 1 ? 'audit-node target' : 'audit-node');
+        var label = node.title || node.domain || new URL(node.url).hostname;
+        if (label.length > 30) label = label.slice(0, 28) + '..';
+        html += '<div class="' + cls + '" title="' + escHtml(node.url) + '"><a href="' + escHtml(node.url) + '" target="_blank">' + escHtml(label) + '</a></div>';
+        if (idx < data.chain.length - 1) html += '<span class="audit-arrow">\\u2192</span>';
+      });
+      html += '</div>';
+    }
+
+    if (data.alternative_paths > 0) {
+      html += '<div class="audit-alt">' + data.alternative_paths + ' alternative path' + (data.alternative_paths > 1 ? 's' : '') + ' from other seeds</div>';
+    }
+
+    // Inbound links
+    if (data.inbound_links && data.inbound_links.length > 0) {
+      html += '<div class="audit-inbound"><div class="audit-label">who links here (' + data.inbound_links.length + ')</div>';
+      data.inbound_links.slice(0, 10).forEach(function(link) {
+        var linkDomain = link.domain || '?';
+        html += '<div class="audit-inbound-item"><a href="' + escHtml(link.url) + '" target="_blank">' + escHtml(linkDomain) + '</a>';
+        if (link.anchor_text) html += ' \\u2014 <span class="audit-anchor">"' + escHtml(link.anchor_text) + '"</span>';
+        html += '</div>';
+      });
+      if (data.inbound_links.length > 10) html += '<div class="audit-inbound-item" style="color:#444">+ ' + (data.inbound_links.length - 10) + ' more</div>';
+      html += '</div>';
+    }
+
+    // Co-cited domains
+    if (data.co_cited_with && data.co_cited_with.length > 0) {
+      html += '<div class="audit-cocited"><div class="audit-label">co-cited with</div>';
+      data.co_cited_with.slice(0, 8).forEach(function(d) {
+        html += '<span class="audit-cocited-domain" onclick="findSimilarFrom(\\'' + escJs(d) + '\\')" style="margin-right:0.6rem">' + escHtml(d) + '</span>';
+      });
+      html += '</div>';
+    }
+
+    el.innerHTML = html || '<div class="empty">no path data available</div>';
+  } catch (e) {
+    el.innerHTML = '<div class="empty">error: ' + e.message + '</div>';
+  }
+}
+
+// ── Graph Visualization ──
+
+var graphLoaded = false;
+
+async function loadGraphViz() {
+  var container = document.getElementById('graphContainer');
+  if (!container) return;
+
+  container.innerHTML = '<div class="loading" style="padding:2rem"><span class="spinner"></span>loading graph data...</div>';
+
+  try {
+    var limit = parseInt(document.getElementById('graphNodeLimit').value) || 80;
+    var showLabels = document.getElementById('graphShowLabels').checked;
+    var res = await fetch(API + '/graphs/' + GRAPH_ID + '/domain-graph?top=' + limit);
+    var data = await res.json();
+
+    if (!data.nodes || data.nodes.length === 0) {
+      container.innerHTML = '<div class="empty" style="padding:2rem">no graph data available</div>';
+      return;
+    }
+
+    // Clear container
+    container.innerHTML = '';
+
+    var width = container.clientWidth;
+    var height = container.clientHeight || 600;
+
+    var svg = d3.select(container).append('svg')
+      .attr('width', width)
+      .attr('height', height)
+      .style('background', '#050505');
+
+    var g = svg.append('g');
+
+    // Zoom
+    var zoom = d3.zoom()
+      .scaleExtent([0.1, 6])
+      .on('zoom', function(event) { g.attr('transform', event.transform); });
+    svg.call(zoom);
+
+    // Build node/link data
+    var nodeMap = {};
+    data.nodes.forEach(function(n) { nodeMap[n.id] = n; });
+
+    var links = data.links.filter(function(l) {
+      return nodeMap[l.source] && nodeMap[l.target];
+    });
+
+    // Scale node size by pagerank
+    var prMax = d3.max(data.nodes, function(n) { return n.pagerank; }) || 1;
+    var rScale = d3.scaleSqrt().domain([0, prMax]).range([3, 18]);
+
+    // Simulation
+    var simulation = d3.forceSimulation(data.nodes)
+      .force('link', d3.forceLink(links).id(function(d) { return d.id; }).distance(60).strength(0.3))
+      .force('charge', d3.forceManyBody().strength(-120))
+      .force('center', d3.forceCenter(width / 2, height / 2))
+      .force('collide', d3.forceCollide().radius(function(d) { return rScale(d.pagerank) + 4; }));
+
+    // Links
+    var link = g.append('g').selectAll('line')
+      .data(links)
+      .join('line')
+      .attr('stroke', '#1a1a1a')
+      .attr('stroke-opacity', function(d) { return Math.min(0.6, 0.1 + d.weight * 0.05); })
+      .attr('stroke-width', function(d) { return Math.min(3, 0.5 + d.weight * 0.3); });
+
+    // Nodes
+    var node = g.append('g').selectAll('circle')
+      .data(data.nodes)
+      .join('circle')
+      .attr('r', function(d) { return rScale(d.pagerank); })
+      .attr('fill', function(d) {
+        if (d.is_seed) return '#4fc3f7';
+        if (d.quality >= 0.7) return '#66bb6a';
+        if (d.quality >= 0.4) return '#ffa726';
+        return '#555';
+      })
+      .attr('stroke', '#0a0a0a')
+      .attr('stroke-width', 1)
+      .attr('cursor', 'pointer')
+      .call(d3.drag()
+        .on('start', function(event, d) {
+          if (!event.active) simulation.alphaTarget(0.3).restart();
+          d.fx = d.x; d.fy = d.y;
+        })
+        .on('drag', function(event, d) {
+          d.fx = event.x; d.fy = event.y;
+        })
+        .on('end', function(event, d) {
+          if (!event.active) simulation.alphaTarget(0);
+          d.fx = null; d.fy = null;
+        })
+      );
+
+    // Labels
+    var label = g.append('g').selectAll('text')
+      .data(data.nodes)
+      .join('text')
+      .text(function(d) { return d.id; })
+      .attr('font-size', '8px')
+      .attr('font-family', "'Berkeley Mono', monospace")
+      .attr('fill', '#666')
+      .attr('dx', function(d) { return rScale(d.pagerank) + 3; })
+      .attr('dy', '0.3em')
+      .style('display', showLabels ? 'block' : 'none')
+      .style('pointer-events', 'none');
+
+    // Tooltip
+    var tooltip = document.getElementById('graphTooltip');
+
+    node.on('mouseover', function(event, d) {
+      tooltip.style.display = 'block';
+      tooltip.innerHTML = '<strong>' + escHtml(d.id) + '</strong><br>' +
+        (d.top_title ? escHtml(d.top_title) + '<br>' : '') +
+        d.pages + ' pages<br>' +
+        'pr: ' + d.pagerank.toFixed(2) +
+        ' \\u00b7 q: ' + d.quality.toFixed(2) +
+        ' \\u00b7 sw: ' + d.smallweb.toFixed(2) +
+        (d.is_seed ? '<br><span style="color:#4fc3f7">seed</span>' : '');
+      // Highlight connections
+      link.attr('stroke', function(l) {
+        return (l.source.id === d.id || l.target.id === d.id) ? '#4fc3f7' : '#1a1a1a';
+      }).attr('stroke-opacity', function(l) {
+        return (l.source.id === d.id || l.target.id === d.id) ? 0.8 : 0.1;
+      });
+      d3.select(this).attr('stroke', '#fff').attr('stroke-width', 2);
+    })
+    .on('mousemove', function(event) {
+      tooltip.style.left = (event.clientX + 12) + 'px';
+      tooltip.style.top = (event.clientY - 10) + 'px';
+    })
+    .on('mouseout', function() {
+      tooltip.style.display = 'none';
+      link.attr('stroke', '#1a1a1a').attr('stroke-opacity', function(d) { return Math.min(0.6, 0.1 + d.weight * 0.05); });
+      d3.select(this).attr('stroke', '#0a0a0a').attr('stroke-width', 1);
+    })
+    .on('click', function(event, d) {
+      findSimilar(d.id);
+    });
+
+    // Tick
+    simulation.on('tick', function() {
+      link
+        .attr('x1', function(d) { return d.source.x; })
+        .attr('y1', function(d) { return d.source.y; })
+        .attr('x2', function(d) { return d.target.x; })
+        .attr('y2', function(d) { return d.target.y; });
+      node
+        .attr('cx', function(d) { return d.x; })
+        .attr('cy', function(d) { return d.y; });
+      label
+        .attr('x', function(d) { return d.x; })
+        .attr('y', function(d) { return d.y; });
+    });
+
+    // Label toggle
+    document.getElementById('graphShowLabels').onchange = function() {
+      label.style('display', this.checked ? 'block' : 'none');
+    };
+
+    graphLoaded = true;
+
+  } catch (e) {
+    container.innerHTML = '<div class="empty" style="padding:2rem">error loading graph: ' + e.message + '</div>';
+  }
 }
 
 function switchRank(rank) {
